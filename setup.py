@@ -17,7 +17,7 @@ setup(
     description="RA8M1 Secure Boot Provisioning Tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Renesas",
+    author="Crypto Quantique",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[

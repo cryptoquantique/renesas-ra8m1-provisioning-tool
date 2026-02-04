@@ -5,5 +5,6 @@ __pycache__/
 output/
 dist/
 build/
+docs/
 
 prerequisites/*

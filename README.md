@@ -184,7 +184,7 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
 ### 1.1 System Requirements
 
 #### Operating System
-- Windows 10/11 (64-bit) - Required due to SKMT and RFP dependencies
+- Windows 10/11 (64-bit)
 - Linux and macOS are not supported
 
 #### Hardware
@@ -206,7 +206,6 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
 #### Step 1: Clone or Extract the Repository
 
 ```bash
-cd C:\Work
 git clone <repository-url> ra8m1-provisioning-tool
 cd ra8m1-provisioning-tool
 ```
@@ -304,7 +303,7 @@ Create a `.env` file in the `provisioning_tool` directory:
 # AWS Credentials
 AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
 AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-AWS_DEFAULT_REGION=eu-central-1
+AWS_DEFAULT_REGION=eu-west-2
 ```
 
 The tool reads credentials from this file automatically. The file is excluded from version control via `.gitignore`.
@@ -389,10 +388,7 @@ The `project_config.json` file is the central configuration for the provisioning
 
 #### 1.4.1 Create Configuration File
 
-Copy the example file:
-```bash
-cp project_config.json.example project_config.json
-```
+Copy or modify the existing file: [project_config.json](./project_config.json)
 
 #### 1.4.2 Configuration Structure
 
@@ -402,7 +398,7 @@ cp project_config.json.example project_config.json
     "version": "1.0.0",
     
     "aws": {
-        "region": "eu-central-1",
+        "region": "eu-west-2",
         "kms": {
             "oem_root_key_id": "3ce24d75-caec-4ba9-b10a-38f7c3ff6dc0",
             "oem_bootloader_key_id": "dc603d76-09dd-48ec-bc24-ae0c033746cf",
@@ -449,7 +445,7 @@ cp project_config.json.example project_config.json
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `region` | AWS region where KMS keys are located | `eu-central-1` |
+| `region` | AWS region where KMS keys are located | `eu-west-2` |
 | `oem_root_key_id` | Key ID for OEM Root Key (signs Key Certificate) | UUID |
 | `oem_bootloader_key_id` | Key ID for OEM Bootloader Key (signs Code Certificate) | UUID |
 | `mcuboot_app_key_id` | Key ID for MCUboot App Key (signs application) | UUID |
@@ -507,8 +503,11 @@ Place the following files in the `prerequisites/` directory before running the w
 | `application.bin` | Your build system | Application binary to sign |
 | `keywrap-pub.key` | Renesas DLM | Public key for UFPK encryption (after registration) |
 
-**Note:** The `tools/` subdirectory contains `srec_cat.exe` which is included in the repository.
+If you already have a W-UFPK, include the following in the `prerequisites/` directory:
+- `ufpk.key`
+- `ufpk_wrapped_decrypted.key`
 
+Which will allow you to skip the wrapping phase via Renesas DLM.
 ---
 
 ## 2. Provisioning Tool Usage
@@ -647,7 +646,7 @@ invoke make-combined-srec
 
 **What it does:**
 1. Converts `application.bin.signed` to SREC with correct offset
-2. Injects AWS KMS `mcuboot_app_key` public key into bootloader at `0x02009114`
+2. Injects AWS KMS `mcuboot_app_key` public key into bootloader at the specified injection address
 3. Combines `bootloader_with_aws_key.srec` + `application_offset.srec`
 4. Verifies no address overlaps
 
@@ -756,13 +755,14 @@ invoke sign-app --help
 
 #### Required Hardware
 - EK-RA8M1 evaluation board
-- USB cable connected to J-Link debug port (J10)
+- USB to micro-USB cable
 - Power via USB or external power supply
 
 #### Board Configuration
-1. Connect USB cable to J10 (J-Link debug port)
-2. Ensure no serial terminal applications are connected to the COM port
-3. Board should be powered on
+1. Connect USB cable to J11 (USB full speed)
+2. Enable BOOT MODE (J16 closed)
+3. Ensure no serial terminal applications are connected to the COM port
+4. Board should be powered on
 
 #### Finding the COM Port
 The J-Link interface appears as a virtual COM port. To find it:
@@ -817,7 +817,7 @@ invoke program-device --lock-device      # Lock device after programming
    Verify output files exist in `output/flow_*/`
 
 2. **Connect device:**
-   - Connect USB cable to J-Link port
+   - Connect USB cable to USB Full Speed Port
    - Verify COM port in Device Manager
 
 3. **Enter boot mode:**
@@ -1176,9 +1176,6 @@ docs/
 ```bash
 # Windows - open in default browser
 start docs\_build\html\index.html
-
-# Or navigate manually to:
-# C:\Work\ra8m1-provisioning-tool\docs\_build\html\index.html
 ```
 
 ### 5.3 Class Diagrams
@@ -1208,20 +1205,3 @@ dot -Tpng docs\diagrams\packages_ProvisioningTool.dot -o docs\diagrams\packages.
 If Graphviz is not installed, view DOT files online:
 - https://dreampuf.github.io/GraphvizOnline/
 - https://edotor.net/
-
----
-
-## Version History
-
-- **v2.0.0** (2026-01-26)
-  - Refactored workflow commands
-  - Added `workflow-all` combined command
-  - AWS KMS key injection into bootloader
-  - Improved CRC calculation with correct bootloader source
-  - Enhanced troubleshooting documentation
-
-- **v1.0.0** (2026-01-15)
-  - Initial release
-  - Certificate versioning and anti-rollback support
-  - AWS KMS integration
-  - CLI interface
