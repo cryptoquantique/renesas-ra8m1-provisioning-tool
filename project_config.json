@@ -1,0 +1,99 @@
+{
+  "_comment": "Renesas RA8M1 Provisioning Tool - Configuration",
+  "_comment2": "Config auto-detected - no need to pass --config explicitly.",
+  
+  "project": {
+    "name": "Renesas RA8M1 Secure Boot Provisioning",
+    "version": "1.0.0"
+  },
+  
+  "dlm": {
+    "email": "",
+    "username": "",
+    "password": "",
+    "server_url": "https://dlm.renesas.com"
+  },
+  
+  "aws": {
+    "access_key_id": "",
+    "secret_access_key": "",
+    "region": "",
+    "kms": {
+      "oem_root_key_id": "",
+      "oem_bootloader_key_id": "",
+      "mcuboot_app_key_id": ""
+    }
+  },
+  
+  "paths": {
+    "bootloader_srec": "prerequisites/bootloader.srec",
+    "application_bin": "prerequisites/app.bin",
+    "output_dir": "output",
+    "srec_cat_exe": "C:/Program Files/srecord/bin/srec_cat.exe",
+    "skmt_path": "C:/Renesas/SecurityKeyManagementTool/cli/skmt.exe"
+  },
+  
+  "firmware": {
+    "app_offset": "0x2010000",
+    "mcuboot_pubkey_addr": "0x02009114",
+    "inject_customer_key": true,
+    "_comment_inject": "If true: inject AWS KMS customer key into bootloader. If false: keep original Renesas demo key.",
+    "_comment_pubkey": "Address where MCUboot public key (root_pub_der) is stored in bootloader."
+  },
+  
+  "imgtool": {
+    "_comment": "MCUboot imgtool parameters - SINGLE SOURCE OF TRUTH",
+    "header_size": "0x200",
+    "align": 128,
+    "max_align": 128,
+    "slot_size": "0x20000",
+    "max_sectors": 4,
+    "version": "1.0.0",
+    "pad_header": true,
+    "pad": true,
+    "confirm": true
+  },
+  
+  "certificates": {
+    "_comment": "FSBL Certificate parameters - SINGLE SOURCE OF TRUTH",
+    
+    "load_addr": "0x02000000",
+    "dest_addr": "0x02000000",
+    "cfsize": "0x200000",
+    "oembl_size": "0x00030000",
+    "mode": "signature",
+    "version": 0,
+    "build_number": 0,
+    "application_version": "1.0.0",
+    
+    "key_certificate": {
+      "_comment": "Key Certificate authenticates OEM_BL_PK using OEM_ROOT_SK",
+      "magic": "0x6B657963",
+      "manifest_version": "0x00010000",
+      "flags": "0x00000000",
+      "tlv_ecc_pubkey_type_length": "0x00088010",
+      "tlv_keyhash_type_length": "0x10144008",
+      "tlv_expected_sig_type_length": "0x20088410"
+    },
+    
+    "code_certificate": {
+      "_comment": "Code Certificate authenticates OEM_BL binary using OEM_BL_SK",
+      "magic": "0x636F6463",
+      "manifest_version": "0x00010000",
+      "flags": "0x00000000",
+      "tlv_ecc_pubkey_type_length": "0x01088010",
+      "tlv_expected_crc_type_length": "0x40000001",
+      "tlv_signer_id_type_length": "0x10144008",
+      "tlv_expected_sig_type_length": "0x25088410"
+    },
+    
+    "_comment2": "Certificate version starts at 1 for clean provisioning after chip erase. Anti-rollback counter (ARC_OEMBL) prevents downgrade."
+  },
+  
+  "device": {
+    "type": "ra8m1",
+    "interface": "rfp",
+    "com_port": null,
+    "lock_after_provisioning": false
+  }
+}
