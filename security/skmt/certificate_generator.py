@@ -59,6 +59,7 @@ class CertificateGenerator:
         oem_bl_pk_file: Path,
         output_file: Path,
         oem_root_pk_file: Optional[Path] = None,
+        hsm_client=None,
     ) -> KeyCertificate:
         """
         Generate Key Certificate.
@@ -72,6 +73,7 @@ class CertificateGenerator:
             output_file: Path to output Key Certificate file
             oem_root_pk_file: Optional path to OEM Root public key file (PEM).
                              If not provided, will be exported from HSM.
+            hsm_client: Optional external HSM client (if provided, caller manages connection)
 
         Returns:
             KeyCertificate object
@@ -80,9 +82,11 @@ class CertificateGenerator:
             SKMTError: If certificate generation fails
             HSMError: If HSM operations fail
         """
+        owns_client = hsm_client is None
         try:
-            hsm_client = create_hsm_client(self.hsm_config)
-            hsm_client.connect()
+            if owns_client:
+                hsm_client = create_hsm_client(self.hsm_config)
+                hsm_client.connect()
 
             try:
                 # Get OEM Root public key
@@ -116,7 +120,8 @@ class CertificateGenerator:
                 return certificate
 
             finally:
-                hsm_client.disconnect()
+                if owns_client:
+                    hsm_client.disconnect()
 
         except Exception as e:
             if isinstance(e, (SKMTError, HSMError)):
@@ -134,6 +139,7 @@ class CertificateGenerator:
         oem_root_pk_file: Optional[Path] = None,
         version: int = 1,
         oem_bl_pk_hash: Optional[bytes] = None,
+        hsm_client=None,
     ) -> CodeCertificate:
         """
         Generate Code Certificate using HSM signing (NO local private keys!).
@@ -152,6 +158,7 @@ class CertificateGenerator:
             oem_root_pk_file: Path to OEM Root public key file (optional)
             version: Certificate version for anti-rollback protection (1-64)
             oem_bl_pk_hash: KEYHASH from Key Certificate - REQUIRED
+            hsm_client: Optional external HSM client (if provided, caller manages connection)
 
         Returns:
             CodeCertificate object
@@ -163,9 +170,11 @@ class CertificateGenerator:
         if bootloader_binary is None and bootloader_binary_file is None:
             raise SKMTError("Either bootloader_binary or bootloader_binary_file must be provided")
 
+        owns_client = hsm_client is None
         try:
-            hsm_client = create_hsm_client(self.hsm_config)
-            hsm_client.connect()
+            if owns_client:
+                hsm_client = create_hsm_client(self.hsm_config)
+                hsm_client.connect()
 
             try:
                 if oem_bl_pk_file and oem_bl_pk_file.exists():
@@ -201,7 +210,8 @@ class CertificateGenerator:
                 return certificate
 
             finally:
-                hsm_client.disconnect()
+                if owns_client:
+                    hsm_client.disconnect()
 
         except Exception as e:
             if isinstance(e, (SKMTError, HSMError)):

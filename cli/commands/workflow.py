@@ -15,7 +15,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, List
 
-import boto3
 import click
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
@@ -45,6 +44,57 @@ logger = get_logger(__name__)
 
 # Initialize managers
 srec_manager = SrecManager()
+
+
+# =============================================================================
+# Key Generation via Broker
+# =============================================================================
+
+def generate_key_via_broker(config, key_type: KeyType, label: str = None, hsm_client=None) -> str:
+    """
+    Generate a new ECC key via the broker using PKCS#11.
+
+    This function ensures all key generation goes through the broker
+    to AWS KMS, maintaining the security boundary.
+
+    Args:
+        config: Application configuration with HSM settings
+        key_type: Type of key to generate (OEM_ROOT, OEM_BOOTLOADER, CUSTOMER)
+        label: Optional label for the key
+        hsm_client: Optional existing HSM client (reuse to avoid Named Pipe conflicts)
+
+    Returns:
+        Key ID/ARN of the generated key
+
+    Raises:
+        HSMError: If key generation fails
+    """
+    owns_client = hsm_client is None
+    try:
+        if owns_client:
+            hsm_client = create_hsm_client(config.hsm)
+            hsm_client.connect()
+
+        key_pair = hsm_client.generate_key_pair(
+            key_type=key_type,
+            curve=KeyCurve.SECP256R1,
+            label=label,
+        )
+
+        if owns_client:
+            hsm_client.disconnect()
+
+        logger.info(f"Generated {key_type.value} key via broker: {key_pair.private_key_handle}")
+        return key_pair.private_key_handle
+
+    except Exception as e:
+        if owns_client and hsm_client:
+            try:
+                hsm_client.disconnect()
+            except Exception:
+                pass
+        logger.error(f"Key generation via broker failed: {e}")
+        raise HSMError(f"Failed to generate key: {e}") from e
 
 
 # =============================================================================
@@ -276,7 +326,7 @@ def prepare_ufpk_file(ctx, ufpk_hardcoded: Optional[str], ufpk_file: Optional[Pa
     flow_folder = get_flow_folder()
     click.echo(f"[DIR] Flow folder: {flow_folder.absolute()}\n")
     
-    # Generate or use UFPK
+    # Generate or use UFPK (native Python - no SKMT required)
     if ufpk_file:
         ufpk_path = ufpk_file
         click.echo(f"[+] Using existing UFPK: {ufpk_path}")
@@ -286,20 +336,15 @@ def prepare_ufpk_file(ctx, ufpk_hardcoded: Optional[str], ufpk_file: Optional[Pa
             click.echo(f"[ERROR] Hardcoded UFPK must be 64 hex characters, got {len(ufpk_hex)}", err=True)
             sys.exit(1)
         ufpk_path = flow_folder / "ufpk.key"
-        skmt_wrapper = SKMTWrapper(
-            skmt_path=config.skmt.skmt_path,
-            working_directory=config.skmt.working_directory,
-        )
-        ufpk_path = skmt_wrapper.generate_ufpk(ufpk_hex=ufpk_hex, output_file=str(ufpk_path))
+        ufpk_bytes = bytes.fromhex(ufpk_hex)
+        ufpk_path.write_bytes(ufpk_bytes)
         click.echo(f"[+] UFPK generated (hardcoded): {ufpk_path.name}")
     else:
+        import os
         ufpk_path = flow_folder / "ufpk.key"
-        skmt_wrapper = SKMTWrapper(
-            skmt_path=config.skmt.skmt_path,
-            working_directory=config.skmt.working_directory,
-        )
-        # Generate RANDOM UFPK (per Renesas docs: 256-bit random key)
-        ufpk_path = skmt_wrapper.generate_ufpk(output_file=str(ufpk_path))
+        # Generate RANDOM UFPK (per Renesas docs: 256-bit = 32 bytes random key)
+        ufpk_bytes = os.urandom(32)
+        ufpk_path.write_bytes(ufpk_bytes)
         click.echo(f"[+] UFPK generated (RANDOM 256-bit): {ufpk_path.name}")
     
     click.echo(f"   Saved to: {ufpk_path.absolute()}\n")
@@ -378,13 +423,29 @@ def upload_dlm(ctx, device_id: Optional[str]):
 
 
 @workflow_group.command("decrypt-wrapped")
-@click.argument("wrapped_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--wrapped-file", "-w",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Path to the wrapped UFPK file downloaded from Renesas email (e.g., ufpk_encrypted_enc.key.pgp)"
+)
 @click.pass_context
 def decrypt_wrapped(ctx, wrapped_file: Path):
     """
     Step 4: Decrypt wrapped UFPK from email.
     
-    WRAPPED_FILE: Path to the wrapped UFPK file downloaded from email.
+    \b
+    Usage:
+        python -m cli workflow decrypt-wrapped --wrapped-file <path_to_file>
+    
+    \b
+    The wrapped UFPK file is received via email from Renesas after
+    uploading the encrypted UFPK to DLM. It is typically a .pgp or .key file.
+    
+    \b
+    Example:
+        python -m cli workflow decrypt-wrapped --wrapped-file output/flow_*/ufpk_encrypted_enc.key.pgp
+        invoke decrypt-wrapped --wrapped-file prerequisites/ufpk_encrypted_enc.key.pgp
     """
     config = ctx.obj["config"]
     
@@ -472,11 +533,11 @@ def generate_rkey(ctx, oem_root_sk_key_id: Optional[str]):
     click.echo("="*70 + "\n")
     
     flow_folder = get_flow_folder()
-    wrapped_ufpk_path = flow_folder / "ufpk_wrapped_decrypted.key"
+    plain_ufpk_path = flow_folder / "ufpk.key"
     
-    if not wrapped_ufpk_path.exists():
-        click.echo(f"[ERROR] Wrapped UFPK not found: {wrapped_ufpk_path}", err=True)
-        click.echo("   Run 'workflow decrypt-wrapped' first.", err=True)
+    if not plain_ufpk_path.exists():
+        click.echo(f"[ERROR] Plain UFPK not found: {plain_ufpk_path}", err=True)
+        click.echo("   Run 'workflow prepare-ufpk-file' first.", err=True)
         sys.exit(1)
 
     if not oem_root_sk_key_id:
@@ -518,289 +579,34 @@ def generate_rkey(ctx, oem_root_sk_key_id: Optional[str]):
     finally:
         hsm_client.disconnect()
     
-    # Generate RKEY
+    # Generate RKEY using native Python (AES-CBC + CBC-MAC encryption)
     rkey_path = flow_folder / "oem_root_key.rkey"
-    skmt_wrapper = SKMTWrapper(
-        skmt_path=config.skmt.skmt_path,
-        working_directory=config.skmt.working_directory,
-    )
     
-    oem_root_pk_bytes = oem_root_pk_file.read_bytes()
-    wrapped_key = skmt_wrapper.wrap_oem_root_public_key(
-        oem_root_pk=oem_root_pk_bytes,
-        ufpk=str(wrapped_ufpk_path),
-        output_file=str(rkey_path),
+    click.echo("   Generating RKEY (native Python AES-CBC + CBC-MAC)...")
+    from security.skmt.native_rkey_generator import generate_rkey_from_files
+    # Needs BOTH plain UFPK (32 bytes, for encryption) and wrapped UFPK (36 bytes, embedded in RKEY)
+    w_ufpk_path = flow_folder / "ufpk_wrapped_decrypted.key"
+    if not w_ufpk_path.exists():
+        # Search in reusable folder
+        w_ufpk_path = get_reusable_folder() / "ufpk_wrapped_decrypted.key"
+    wrapped_key = generate_rkey_from_files(
+        oem_root_pk_file=oem_root_pk_file,
+        ufpk_file=plain_ufpk_path,
+        output_file=rkey_path,
+        w_ufpk_file=w_ufpk_path,
     )
     
     click.echo(f"[+] RKEY generated: {rkey_path.name}")
-    click.echo(f"   Saved to: {rkey_path.absolute()}\n")
-    click.echo("[OK] Step 5 complete! Run: workflow generate-certs")
-
-
-@workflow_group.command("generate-certs")
-@click.option(
-    "--oem-root-sk-key-id",
-    type=str,
-    help="AWS KMS Key ID for OEM Root Secret Key.",
-)
-@click.option(
-    "--oem-bl-sk-key-id",
-    type=str,
-    help="AWS KMS Key ID for OEM Bootloader Secret Key.",
-)
-@click.option(
-    "--bootloader-binary",
-    type=click.Path(exists=True, path_type=Path),
-    help="Bootloader binary file (.bin or .srec).",
-)
-@click.option(
-    "--version",
-    type=int,
-    help="Certificate version (default: auto-increment from config). WARNING: Must be > current ARC_OEMBL value!",
-)
-@click.pass_context
-def generate_certs(ctx, oem_root_sk_key_id: Optional[str], oem_bl_sk_key_id: Optional[str], bootloader_binary: Optional[Path], version: Optional[int]):
-    """
-    Step 6: Generate Key and Code Certificates.
+    click.echo(f"   Saved to: {rkey_path.absolute()}")
     
-    Uses auto-incrementing version counter from aws_credentials.json for anti-rollback protection.
-    Version starts at 25 due to previous device programming attempts.
-    """
-    config = ctx.obj["config"]
-    
-    click.echo("\n" + "="*70)
-    click.echo("Step 6: Generating Certificates")
-    click.echo("="*70 + "\n")
-    
-    # Check if reusable certificates already exist
+    # Copy RKEY to reusable folder so it persists across flow folders
     reusable_folder = get_reusable_folder()
-    existing_certs = [
-        reusable_folder / "oem_root_key.rkey",
-        reusable_folder / "key_cert.bin",
-        reusable_folder / "code_cert.bin",
-    ]
+    reusable_rkey = reusable_folder / "oem_root_key.rkey"
+    import shutil
+    shutil.copy2(rkey_path, reusable_rkey)
+    click.echo(f"   [+] RKEY copied to reusable folder: {reusable_rkey}")
     
-    certs_exist = all(f.exists() for f in existing_certs)
-    
-    if certs_exist:
-        # Prompt user: reuse or regenerate
-        if prompt_reuse_or_regenerate("certificates", existing_certs):
-            click.echo(f"\nReusing existing certificates from: {reusable_folder.absolute()}")
-            
-            # Copy to current flow folder for consistency
-            flow_folder = get_flow_folder()
-            for cert_file in existing_certs:
-                dest = flow_folder / cert_file.name
-                shutil.copy2(cert_file, dest)
-                click.echo(f"   [+] Copied: {cert_file.name}")
-            
-            click.echo(f"\n[OK] Certificates ready in flow folder: {flow_folder.absolute()}")
-            click.echo("[OK] Run: workflow sign-app (optional) or workflow program-device")
-            return
-        else:
-            click.echo(f"\nRegenerating certificates...")
-    
-    # Check version overflow before proceeding
-    current_ver, remaining, is_critical = check_version_overflow()
-    if is_critical:
-        click.echo(f"[WARN] Certificate version: {current_ver}/64")
-        click.echo(f"[WARN] Only {remaining} versions remaining before ARC_OEMBL overflow!")
-        click.echo(f"[WARN] Consider re-initializing device or using new keys.\n")
-    
-    # Get certificate version
-    if version is None:
-        cert_version = get_current_certificate_version()
-        click.echo(f"[INFO] Certificate version: {cert_version} (auto from config)")
-        click.echo(f"[INFO] Next certificate will use version: {cert_version + 1}\n")
-    else:
-        cert_version = version
-        click.echo(f"[INFO] Certificate version: {cert_version} (manual override)\n")
-        if cert_version <= current_ver:
-            click.echo(f"[WARN] Manual version {cert_version} <= current {current_ver}")
-            click.echo(f"[WARN] Device will REJECT this if ARC_OEMBL >= {cert_version}!")
-            if not click.confirm("Continue anyway?"):
-                sys.exit(0)
-    
-    flow_folder = get_flow_folder()
-    
-    # Get keys if not provided
-    hsm_client = create_hsm_client(config.hsm)
-    hsm_client.connect()
-    try:
-        if not oem_root_sk_key_id or not oem_bl_sk_key_id:
-            keys = hsm_client.list_keys()
-            
-            if not oem_root_sk_key_id:
-                oem_root_keys = [
-                    (k.get("KeyId"), k.get("AliasNames", [""])[0].replace("alias/", ""))
-                    for k in keys
-                    if "oem_root" in k.get("AliasNames", [""])[0].lower()
-                ]
-                if not oem_root_keys:
-                    click.echo("[ERROR] No OEM_ROOT keys found!", err=True)
-                    sys.exit(1)
-                click.echo("Available OEM Root keys:")
-                for i, (key_id, alias) in enumerate(oem_root_keys, 1):
-                    click.echo(f"  {i}. {alias} ({key_id[:12]}...)")
-                selection = click.prompt("Select OEM Root key", type=int)
-                oem_root_sk_key_id = oem_root_keys[selection - 1][0]
-            
-            if not oem_bl_sk_key_id:
-                oem_bl_keys = [
-                    (k.get("KeyId"), k.get("AliasNames", [""])[0].replace("alias/", ""))
-                    for k in keys
-                    if "oem_bootloader" in k.get("AliasNames", [""])[0].lower() or "bootloader" in k.get("AliasNames", [""])[0].lower()
-                ]
-                if not oem_bl_keys:
-                    click.echo("[ERROR] No OEM_BOOTLOADER keys found!", err=True)
-                    sys.exit(1)
-                click.echo("Available OEM Bootloader keys:")
-                for i, (key_id, alias) in enumerate(oem_bl_keys, 1):
-                    click.echo(f"  {i}. {alias} ({key_id[:12]}...)")
-                selection = click.prompt("Select OEM Bootloader key", type=int)
-                oem_bl_sk_key_id = oem_bl_keys[selection - 1][0]
-        
-        # Get bootloader binary
-        if not bootloader_binary:
-            bootloader_binary = click.prompt(
-                "Enter path to bootloader binary file",
-                type=click.Path(exists=True, path_type=Path),
-            )
-
-        oem_root_pk_der = hsm_client.get_public_key(oem_root_sk_key_id)
-        oem_root_pk_file = flow_folder / "oem_root_public.pem"
-        save_public_key_pem(oem_root_pk_der, oem_root_pk_file, KeyCurve.SECP256R1)
-
-        oem_bl_pk_der = hsm_client.get_public_key(oem_bl_sk_key_id)
-        oem_bl_pk_file = flow_folder / "oem_bl_public.pem"
-        save_public_key_pem(oem_bl_pk_der, oem_bl_pk_file, KeyCurve.SECP256R1)
-        
-        # Generate Key Certificate
-        click.echo("   Generating Key Certificate...")
-        key_cert_path = flow_folder / f"key_cert_v{cert_version}.bin"
-        cert_generator = CertificateGenerator(config.skmt)
-        key_cert = cert_generator.generate_key_certificate(
-            oem_root_sk_handle=oem_root_sk_key_id,
-            oem_root_pk=oem_root_pk_file.read_bytes(),
-            oem_bl_pk=oem_bl_pk_file.read_bytes(),
-            output_file=str(key_cert_path),
-        )
-        click.echo(f"[+] Key Certificate v{cert_version} generated: {key_cert_path.name}")
-        
-        # Generate Code Certificate
-        click.echo(f"   Generating Code Certificate (version {cert_version})...")
-        code_cert_path = flow_folder / f"code_cert_v{cert_version}.bin"
-        bootloader_bytes = bootloader_binary.read_bytes()
-        
-
-        if bootloader_binary.name == "bootloader.srec":
-            click.echo(f"   [WARNING] Generating Code Certificate on bootloader.srec", err=True)
-            click.echo(f"   [WARNING] This will FAIL if device is flashed with bootloader_with_key.srec!", err=True)
-            click.echo(f"   [TIP] Use 'invoke sign-app' instead, which uses bootloader_with_key.srec", err=True)
-        
-
-        proj_config = get_project_config()
-        load_addr = int(proj_config.cert_load_addr, 16)
-        cfsize = int(proj_config.cert_cfsize, 16)
-        bl_binary = parse_srec(bootloader_binary, load_addr, cfsize)
-        click.echo(f"   Bootloader binary: {len(bl_binary)} bytes (ACTUAL size)")
-
-        code_cert = cert_generator.generate_code_certificate(
-            oem_bl_sk_key_id=oem_bl_sk_key_id,
-            bootloader_binary=bl_binary,
-            output_file=code_cert_path,
-            oem_bl_pk_file=oem_bl_pk_file,
-            oem_root_sk_key_id=oem_root_sk_key_id,
-            oem_root_pk_file=oem_root_pk_file,
-            version=cert_version,
-            oem_bl_pk_hash=key_cert.oem_bl_pk_hash,
-        )
-        click.echo(f"[+] Code Certificate v{cert_version} generated: {code_cert_path.name}")
-
-        key_cert_keyhash = key_cert.oem_bl_pk_hash
-        code_cert_data = code_cert_path.read_bytes()
-        signer_id_offset = 36 + 4 + 68 + 8 + 4  # Type&Length (4 bytes)
-        code_cert_signer_id = code_cert_data[signer_id_offset:signer_id_offset + 32]
-
-        if key_cert_keyhash != code_cert_signer_id:
-            click.echo(f"\n{'='*70}", err=True)
-            click.echo(f"   [ERROR] CRITICAL: SIGNER_ID != KEYHASH - PROVISIONING STOPPED!", err=True)
-            click.echo(f"{'='*70}", err=True)
-            click.echo(f"   [ERROR] Key Cert KEYHASH:   {key_cert_keyhash.hex()}", err=True)
-            click.echo(f"   [ERROR] Code Cert SIGNER_ID: {code_cert_signer_id.hex()}", err=True)
-            click.echo(f"   [ERROR] These MUST be equal byte-by-byte for chain of trust!", err=True)
-            click.echo(f"   [ERROR] Device will REJECT certificates with this mismatch!", err=True)
-            click.echo(f"{'='*70}\n", err=True)
-            raise click.ClickException(
-                "OBLIGATORY ASSERT FAILED: signer_id != keyhash. "
-                "Provisioning stopped - certificates will be rejected by device!"
-            )
-
-        click.echo(f"   [OK] OBLIGATORY ASSERT PASSED: signer_id == keyhash")
-        click.echo(f"   [OK] KEYHASH:   {key_cert_keyhash.hex()[:16]}...")
-        click.echo(f"   [OK] SIGNER_ID: {code_cert_signer_id.hex()[:16]}...")
-        click.echo(f"   [OK] Chain of trust verification will PASS!")
-        click.echo(f"   Version: {cert_version}")
-        click.echo(f"   Saved to: {flow_folder.absolute()}\n")
-        
-        # Save to reusable folder for future use
-        click.echo("   Copying certificates to reusable folder...")
-        reusable_folder = get_reusable_folder()
-        
-        # Generate RKEY (wrapped OEM Root Public Key)
-        click.echo("   Generating RKEY (wrapped OEM Root Public Key)...")
-        rkey_path = flow_folder / "oem_root_key.rkey"
-        if not rkey_path.exists():
-            click.echo(f"   [WARN] RKEY generation not yet implemented")
-
-        files_to_copy = [
-            (key_cert_path, reusable_folder / f"key_cert_v{cert_version}.bin"),
-            (code_cert_path, reusable_folder / f"code_cert_v{cert_version}.bin"),
-        ]
-        
-        if rkey_path.exists():
-            files_to_copy.append((rkey_path, reusable_folder / "oem_root_key.rkey"))
-        
-        for src, dest in files_to_copy:
-            shutil.copy2(src, dest)
-            click.echo(f"   [+] Saved: {dest.name} → {reusable_folder.absolute()}")
-
-        readme_path = reusable_folder / "README.txt"
-        readme_content = f"""Provisioning Assets - Reusable Files
-=====================================
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Certificate Version: {cert_version}
-
-WARNING: CRITICAL - Keep these files secure! They contain security keys!
-
-Files in this folder can be reused for ALL devices in this production series.
-
-Files:
-- oem_root_key.rkey: OEM Root Public Key (wrapped with W-UFPK)
-- key_cert.bin: Key Certificate (authenticates Bootloader Key)
-- code_cert.bin: Code Certificate (authenticates Bootloader binary, version {cert_version})
-
-Usage:
-  1. Run 'invoke sign-app' to sign new applications
-  2. Run 'invoke program-device' to program devices
-  
-  The tool will automatically use certificates from this folder.
-"""
-        readme_path.write_text(readme_content)
-        click.echo(f"   [+] Created: README.txt\n")
-        
-        # Increment version for next certificate (only if not manually overridden)
-        if version is None:
-            new_version = increment_certificate_version()
-            click.echo(f"[INFO] Certificate version incremented: {cert_version} → {new_version}")
-            click.echo(f"[INFO] Next certificate generation will use version {new_version}\n")
-        
-    finally:
-        hsm_client.disconnect()
-    
-    click.echo(f"[OK] Step 6 complete!")
-    click.echo(f"[OK] Certificates saved to: {reusable_folder.absolute()}")
-    click.echo(f"[OK] Run: workflow sign-app (optional) or workflow program-device")
+    click.echo("\n[OK] Step 5 complete! Run: invoke gen-fsbl-certs")
 
 
 @workflow_group.command("prepare-srec")
@@ -1034,6 +840,37 @@ def _add_osm_records_to_combined(combined_path: Path, bootloader_path: Path):
                 # OSM addresses: 0x0300Axxx (CF/DF protection) and 0x2703xxxx (security)
                 if addr.upper().startswith('0300A') or addr.upper().startswith('27030'):
                     osm_records.append(line)
+    
+    if not osm_records:
+        # Search for OSM records in configurable reference locations
+        # Check project_config.json paths section for reference SREC files
+        ref_search_dirs = [
+            Path("prerequisites"),
+            Path("output/reusable"),
+            Path("."),
+            Path(".."),
+        ]
+        
+        for search_dir in ref_search_dirs:
+            if not search_dir.exists():
+                continue
+            # Look for any .srec files that might contain OSM records
+            for srec_file in search_dir.glob("*.srec"):
+                try:
+                    with open(srec_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith('S3'):
+                                addr = line[4:12]
+                                if addr.upper().startswith('0300A') or addr.upper().startswith('27030'):
+                                    osm_records.append(line)
+                    if osm_records:
+                        click.echo(f"   [INFO] Found OSM records in: {srec_file}")
+                        break
+                except Exception:
+                    continue
+            if osm_records:
+                break
     
     if not osm_records:
         click.echo("   [WARN] No OSM records found - device may not boot correctly!")
@@ -1421,17 +1258,13 @@ def sign_app(
                     selection = click.prompt("Select signing key", type=int, default=1)
                     
                     if selection == len(oem_bl_keys) + 1:
-                        click.echo("\n[*] Creating new Customer key in AWS KMS...")
-                        new_key = hsm_client.kms_client.create_key(
-                            Description=f'RA8M1 Customer Key - Used for application signing (created {datetime.now().strftime("%Y-%m-%d %H:%M")})',
-                            KeyUsage='SIGN_VERIFY',
-                            KeySpec='ECC_NIST_P256',
-                            Tags=[
-                                {'TagKey': 'ProvisioningType', 'TagValue': 'CUSTOMER'},
-                                {'TagKey': 'CreationDate', 'TagValue': datetime.now().isoformat()}
-                            ]
+                        click.echo("\n[*] Creating new Customer key via broker...")
+                        key_pair = hsm_client.generate_key_pair(
+                            key_type=KeyType.CUSTOMER,
+                            curve=KeyCurve.SECP256R1,
+                            label="RA8M1_CUSTOMER",
                         )
-                        customer_key_id = new_key['KeyMetadata']['KeyId']
+                        customer_key_id = key_pair.private_key_handle
                         click.echo(f"[OK] New key created: {customer_key_id[:20]}...")
                     else:
                         customer_key_id = oem_bl_keys[selection - 1][0]
@@ -1489,14 +1322,11 @@ def sign_app(
     offset_value = int(app_offset, 16)
     signed_offset_path = flow_folder / "app_signed_offset.srec"
 
-    # Get srec_cat path from project_config.json
-    proj_config = get_project_config()
-    srec_cat_exe = proj_config.srec_cat_exe
+    srec_cat_exe = Path(__file__).parent.parent.parent / "prerequisites" / "tools" / "srec_cat.exe"
 
     if not srec_cat_exe.exists():
         click.echo(f"   [ERROR] srec_cat.exe not found at: {srec_cat_exe}", err=True)
-        click.echo(f"   [ERROR] Please configure 'paths.srec_cat_exe' in project_config.json", err=True)
-        click.echo(f"   [ERROR] Or install SRecord and set the path to srec_cat.exe", err=True)
+        click.echo(f"   [ERROR] Please ensure srec_cat.exe is in prerequisites folder", err=True)
         sys.exit(1)
     
     try:
@@ -1576,7 +1406,7 @@ def sign_app(
     click.echo("Step 3.6: Code Certificate generation deferred")
     click.echo("-"*50)
     click.echo("   [INFO] Code Certificate will be generated in Step 4.1 (after combined.srec is created)")
-    click.echo("   [INFO] SKMT requires 'OEM Bootloader Image' = combined.srec (FSBL + MCUboot + App)")
+    click.echo("   [INFO] Code Certificate requires 'OEM Bootloader Image' = combined.srec (FSBL + MCUboot + App)")
     click.echo("   [INFO] Image Size will be calculated from combined.srec span (not just bootloader region)")
     
     # === Step 4: Combine with Bootloader using srec_cat ===
@@ -1691,8 +1521,8 @@ def sign_app(
             if key_cert_path.exists():
                 try:
                     skmt_wrapper = SKMTWrapper(
-                        skmt_path=config.skmt.skmt_path,
-                        working_directory=config.skmt.working_directory,
+                        skmt_path=None,
+                        working_directory="./skmt_work",
                     )
                     key_cert = skmt_wrapper.parse_key_certificate(str(key_cert_path))
                     oem_bl_pk_hash = key_cert.oem_bl_pk_hash
@@ -1736,8 +1566,8 @@ def sign_app(
                 
                 try:
                     skmt_wrapper = SKMTWrapper(
-                        skmt_path=config.skmt.skmt_path,
-                        working_directory=config.skmt.working_directory,
+                        skmt_path=None,
+                        working_directory="./skmt_work",
                     )
                     code_cert_parsed = skmt_wrapper._parse_code_certificate(code_cert_path.read_bytes())
                     code_cert_signer_id = code_cert_parsed.signer_id
@@ -1876,19 +1706,34 @@ def program_device(ctx, com_port: Optional[str], lock_device: bool, bootloader_b
         return None
     
     def find_file_with_fallback(filename: str, description: str) -> Path:
-        """Find file in flow folder, fallback to reusable folders."""
-        # Check multiple locations
+        """Find file in flow folder, fallback to reusable folders and prerequisites."""
+        # Check multiple locations in priority order
         reuse_ufpk_folder = Path("output/reuse_ufpk")
+        prerequisites_folder = Path("prerequisites")
         search_paths = [
             (flow_folder / filename, "flow"),
             (reusable_folder / filename, "reusable"),
             (reuse_ufpk_folder / filename, "reuse_ufpk"),
+            (prerequisites_folder / filename, "prerequisites"),
         ]
         
         for path, location in search_paths:
             if path.exists():
                 click.echo(f"   [+] Using {description} from {location}: {filename}")
                 return path
+        
+        # Fallback: search ALL existing flow folders (oldest to newest)
+        output_base = Path("output")
+        if output_base.exists():
+            all_flows = sorted(
+                [d for d in output_base.iterdir() if d.is_dir() and d.name.startswith("flow_")],
+                key=lambda x: x.name, reverse=True
+            )
+            for folder in all_flows:
+                candidate = folder / filename
+                if candidate.exists():
+                    click.echo(f"   [+] Using {description} from previous flow: {folder.name}/{filename}")
+                    return candidate
         
         return None
     
@@ -2006,17 +1851,23 @@ def program_device(ctx, com_port: Optional[str], lock_device: bool, bootloader_b
     if success:
         click.echo("")
         click.echo("="*70)
-        click.echo("[OK] Device Programming Complete!")
+        if lock_device:
+            click.echo("[OK] Device Programming & Lock Complete!")
+        else:
+            click.echo("[OK] Device Programming Complete!")
         click.echo("="*70)
         click.echo(f"\n[DIR] All files saved in: {flow_folder.absolute()}")
+        if lock_device:
+            click.echo(f"\n   Device state: LCK_BOOT (locked, irreversible)")
+        else:
+            click.echo(f"\n   Device state: OEM_PL0")
         click.echo("\nNext steps:")
         click.echo("  1. Reset the board")
         click.echo("  2. Verify application runs correctly")
         click.echo("\n[TIP] To start a new workflow, run: workflow start")
         click.echo("")
     else:
-        click.echo("[ERROR] Device programming failed!", err=True)
-        sys.exit(1)
+        raise click.ClickException("Device programming failed!")
 
 
 # =============================================================================
@@ -2186,7 +2037,7 @@ def provisioning_cli_commands_help(section: str):
     Steps performed:
       1. Locate UFPK files (searches flow folders and reuse_ufpk/)
       2. Export OEM Root Public Key from AWS KMS
-      3. Wrap public key with UFPK using SKMT tool
+      3. Wrap public key with UFPK using native Python (AES-CBC + CBC-MAC)
       4. Save RKEY to flow folder
 
     Inputs:

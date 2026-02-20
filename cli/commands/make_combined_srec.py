@@ -27,10 +27,9 @@ import click
 
 from utils.project_config import get_project_config
 from utils.srec_combiner import SrecCombiner
-from utils.key_injector import inject_aws_kms_key
+from utils.key_injector import inject_key_into_srec
 from utils.exceptions import FirmwareError, ConfigError
 from utils.logging import get_logger
-from utils.aws_credentials import load_aws_credentials
 
 logger = get_logger(__name__)
 
@@ -132,7 +131,7 @@ def make_combined_srec_command(
         # Display key injection mode prominently at the start
         click.echo("-"*70)
         if inject_aws_key:
-            click.echo("[KEY MODE] INJECT AWS KMS CUSTOMER KEY")
+            click.echo("[KEY MODE] INJECT CUSTOMER KEY")
             click.echo("           MCUboot will verify apps signed with YOUR AWS KMS key")
         else:
             click.echo("[KEY MODE] KEEP ORIGINAL RENESAS DEMO KEY")
@@ -142,7 +141,7 @@ def make_combined_srec_command(
         
         # Auto-detect app_signed_bin if not provided
         if not app_signed_bin:
-            output_dir = Path("output")
+            output_dir = Path(proj_config.output_dir)
             if not output_dir.exists():
                 click.echo("[ERROR] No output directory found. Run 'sign-app' first.", err=True)
                 sys.exit(1)
@@ -159,11 +158,25 @@ def make_combined_srec_command(
                 sys.exit(1)
             
             latest_flow = flow_dirs[0]
-            app_signed_bin = latest_flow / "blinky.bin.signed"
             
-            if not app_signed_bin.exists():
-                click.echo(f"[ERROR] No signed app found in latest flow: {latest_flow}", err=True)
-                sys.exit(1)
+            # Infer signed filename from project_config.json application_bin
+            # e.g., application_bin = "prerequisites/blinky.bin" → "blinky.bin.signed"
+            app_bin_name = Path(proj_config.application_bin).name  # e.g., "blinky.bin"
+            expected_signed = latest_flow / f"{app_bin_name}.signed"  # e.g., "blinky.bin.signed"
+            
+            if expected_signed.exists():
+                app_signed_bin = expected_signed
+            else:
+                # Fallback: search for any .bin.signed file in the latest flow
+                signed_files = list(latest_flow.glob("*.bin.signed"))
+                if signed_files:
+                    app_signed_bin = signed_files[0]
+                else:
+                    click.echo(f"[ERROR] No signed app found in latest flow: {latest_flow}", err=True)
+                    click.echo(f"  Expected: {expected_signed.name} (from project_config application_bin)", err=True)
+                    click.echo(f"  Also searched for: *.bin.signed", err=True)
+                    click.echo(f"  Run 'sign-app' first to sign your application.", err=True)
+                    sys.exit(1)
             
             click.echo(f"Auto-detected signed app: {app_signed_bin}")
         
@@ -213,36 +226,39 @@ def make_combined_srec_command(
             click.echo(f"\n{'-'*70}")
             click.echo("Step 1.5: Inject AWS KMS public key into bootloader")
             click.echo("-"*70)
-            click.echo("HACK: Replacing MCUboot root_pub_der with AWS KMS mcuboot_app_key")
-            
+            click.echo("Replacing MCUboot demo root_pub_der with customer public key from HSM")
+
+            from config.settings import HSMConfig
+            from security.hsm.factory import create_hsm_client
+
+            key_address = int(proj_config.mcuboot_pubkey_addr, 16)
+            modified_bootloader = app_signed_bin.parent / "bootloader_with_aws_key.srec"
+
+            hsm_config = HSMConfig(
+                hsm_type=proj_config.hsm_type,
+                aws_region=proj_config.aws_region,
+                aws_access_key_id=proj_config.aws_access_key_id,
+                aws_secret_access_key=proj_config.aws_secret_access_key,
+            )
+            hsm_client = create_hsm_client(hsm_config)
+            hsm_client.connect()
             try:
-                aws_creds = load_aws_credentials()
-                key_address = int(proj_config.mcuboot_pubkey_addr, 16)
-                
-                # Create modified bootloader in flow folder
-                modified_bootloader = app_signed_bin.parent / "bootloader_with_aws_key.srec"
-                
-                inject_aws_kms_key(
-                    srec_file=bootloader_srec,
-                    kms_key_id=proj_config.mcuboot_app_key_id,
-                    key_address=key_address,
-                    aws_config={
-                        'region': aws_creds.region or 'eu-central-1',
-                        'access_key_id': aws_creds.access_key_id,
-                        'secret_access_key': aws_creds.secret_access_key
-                    },
-                    output_file=modified_bootloader
-                )
-                
-                click.echo(f"[OK] Injected AWS KMS key at 0x{key_address:08X}")
-                click.echo(f"[OK] Modified bootloader: {modified_bootloader.name}")
-                
-                # Use modified bootloader for combine
-                bootloader_srec = modified_bootloader
-                
-            except Exception as e:
-                click.echo(f"[ERROR] Key injection failed: {e}", err=True)
-                click.echo("[WARN] Continuing with original bootloader (signature verification will fail!)")
+                public_key_der = hsm_client.get_public_key(proj_config.mcuboot_app_key_id)
+            finally:
+                hsm_client.disconnect()
+
+            inject_key_into_srec(
+                srec_file=bootloader_srec,
+                key_der=public_key_der,
+                key_address=key_address,
+                output_file=modified_bootloader,
+            )
+
+            click.echo(f"[OK] Injected AWS KMS key at 0x{key_address:08X}")
+            click.echo(f"[OK] Modified bootloader: {modified_bootloader.name}")
+
+            # Use modified bootloader for combine
+            bootloader_srec = modified_bootloader
         
         # Step 2: Combine SREC files
         click.echo(f"\n{'-'*70}")
@@ -274,7 +290,9 @@ def make_combined_srec_command(
         click.echo(f"{'='*70}")
         click.echo(f"\nOutput: {out}")
         click.echo(f"Size:   {out.stat().st_size} bytes")
-        click.echo(f"\nNext step: Run 'program-device' to flash to device")
+        click.echo(f"\nNext steps:")
+        click.echo(f"  1. invoke gen-fsbl-certs  # Generate FSBL certificates (uses combined.srec for CRC)")
+        click.echo(f"  2. invoke program-device  # Flash firmware + certificates to device")
         
     except ConfigError as e:
         click.echo(f"\n[ERROR] Configuration error: {e}", err=True)

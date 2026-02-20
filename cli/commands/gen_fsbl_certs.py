@@ -230,13 +230,14 @@ def gen_fsbl_certs_command(
         click.echo("Initializing Certificate Generator...")
         click.echo("-"*70)
         
+        # Certificate generation uses HSM signing (no SKMT executable needed)
         skmt_config = SKMTConfig(
-            skmt_path=Path("skmt"),  # TODO: Configure proper path
+            skmt_path="",
             working_directory=out.parent / "skmt_work"
         )
         
         hsm_config = HSMConfig(
-            hsm_type="aws_kms",
+            hsm_type=proj_config.hsm_type,  # Use config (broker or aws_kms)
             aws_region=proj_config.aws_region,
             aws_access_key_id=proj_config.aws_access_key_id,
             aws_secret_access_key=proj_config.aws_secret_access_key
@@ -280,7 +281,8 @@ def gen_fsbl_certs_command(
             oem_root_sk_key_id=oemroot_kms_key_id,
             oem_bl_pk_file=oem_bl_pk_pem,
             output_file=key_cert_path,
-            oem_root_pk_file=oem_root_pk_pem
+            oem_root_pk_file=oem_root_pk_pem,
+            hsm_client=hsm_client,
         )
         click.echo(f"  [OK] Generated: {key_cert_path.name}")
         click.echo(f"    Size: {key_cert_path.stat().st_size} bytes")
@@ -312,7 +314,8 @@ def gen_fsbl_certs_command(
             bootloader_binary=bl_binary,
             output_file=code_cert_path,
             version=ver,
-            oem_bl_pk_hash=oem_bl_pk_hash
+            oem_bl_pk_hash=oem_bl_pk_hash,
+            hsm_client=hsm_client,
         )
         click.echo(f"  [OK] Generated: {code_cert_path.name}")
         click.echo(f"    Size: {code_cert_path.stat().st_size} bytes")
@@ -350,7 +353,10 @@ def gen_fsbl_certs_command(
         click.echo(f"  [OK] Magic bytes valid")
         click.echo(f"  [OK] TLV lengths correct")
         click.echo(f"  [OK] Certificate chain valid (KEYHASH == SIGNER_ID)")
-        click.echo(f"\nNext step: Run 'make-combined-srec' with --codecert-bin {code_cert_path}")
+        click.echo(f"\nNext step:")
+        click.echo(f"  invoke program-device  # Flash firmware + certificates to device")
+        
+        hsm_client.disconnect()
         
     except ConfigError as e:
         click.echo(f"\n[ERROR] Configuration error: {e}", err=True)

@@ -38,6 +38,9 @@ from cli.commands.gen_fsbl_certs import gen_fsbl_certs_command
 from cli.commands.make_combined_srec import make_combined_srec_command
 from cli.commands.generate_rkey import generate_rkey_command
 
+# Crypto broker commands
+from cli.commands.broker import broker_group
+
 
 @click.group()
 @click.option(
@@ -93,19 +96,30 @@ cli.add_command(gen_fsbl_certs_command)
 cli.add_command(make_combined_srec_command)
 cli.add_command(generate_rkey_command)
 
+# Crypto broker commands
+cli.add_command(broker_group)
+
 
 def main():
     """Main entry point for CLI."""
     import sys
-    
+
+    from utils.exceptions import ProvisioningToolError
+
     # If called as 'workflow' entry point, adjust argv
     # sys.argv[0] will be 'workflow' or 'workflow.exe'
     # We need to change it to 'cli' so Click recognizes it
     if len(sys.argv) > 0 and ('workflow' in sys.argv[0] or sys.argv[0].endswith('workflow.exe')):
         # Reconstruct: ['workflow', 'start'] -> ['cli', 'workflow', 'start']
         sys.argv = ['cli'] + sys.argv[1:]
-    
-    cli(obj={})
+
+    try:
+        cli(obj={})
+    except click.ClickException:
+        raise  # Let Click handle its own exceptions (message + exit 1, no traceback)
+    except ProvisioningToolError as e:
+        click.echo(click.style(f"[ERROR] {e}", fg="red", bold=True), err=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

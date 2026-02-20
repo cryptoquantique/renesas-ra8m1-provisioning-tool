@@ -82,9 +82,6 @@ class ConfigLoader:
         if "hsm" in data:
             self._update_hsm_config(data["hsm"])
 
-        if "skmt" in data:
-            self._update_skmt_config(data["skmt"])
-
         if "pgp" in data:
             self._update_pgp_config(data["pgp"])
 
@@ -128,19 +125,9 @@ class ConfigLoader:
                     if not self.config.hsm.aws_secret_access_key:
                         self.config.hsm.aws_secret_access_key = aws_creds.secret_access_key
                     if not self.config.hsm.aws_region or self.config.hsm.aws_region == "us-east-1":
-                        self.config.hsm.aws_region = aws_creds.region or "eu-central-1"
+                        self.config.hsm.aws_region = aws_creds.region or self.config.hsm.aws_region
             except Exception as e:
                 logger.debug(f"Could not load AWS credentials from JSON: {str(e)}")
-
-        skmt_path = os.getenv(f"{self.ENV_PREFIX}SKMT_PATH")
-        if skmt_path:
-            self.config.skmt.skmt_path = skmt_path
-        elif not self.config.skmt.skmt_path:
-            # Auto-detect SKMT in app folder
-            auto_skmt_path = self._auto_detect_skmt()
-            if auto_skmt_path:
-                self.config.skmt.skmt_path = auto_skmt_path
-                logger.info(f"Auto-detected SKMT path: {auto_skmt_path}")
 
         dlm_url = os.getenv(f"{self.ENV_PREFIX}DLM_SERVER_URL")
         if dlm_url:
@@ -240,13 +227,6 @@ class ConfigLoader:
         if "aws_region" in data:
             self.config.hsm.aws_region = data["aws_region"]
 
-    def _update_skmt_config(self, data: dict) -> None:
-        """Update SKMT configuration from dictionary."""
-        if "skmt_path" in data:
-            self.config.skmt.skmt_path = data["skmt_path"]
-        if "working_directory" in data:
-            self.config.skmt.working_directory = data["working_directory"]
-
     def _update_pgp_config(self, data: dict) -> None:
         """Update PGP configuration from dictionary."""
         if "gpg_path" in data:
@@ -308,7 +288,7 @@ class ConfigLoader:
         Validate loaded configuration.
 
         Only validates if values are provided, doesn't require all fields.
-        This allows GUI to start without complete configuration.
+        This allows the tool to start without complete configuration.
 
         Raises:
             ConfigurationError: If provided configuration is invalid
@@ -317,81 +297,5 @@ class ConfigLoader:
         if self.config.hsm.pkcs11_library and not Path(self.config.hsm.pkcs11_library).exists():
             logger.warning(f"PKCS#11 library path does not exist: {self.config.hsm.pkcs11_library}")
 
-        if self.config.skmt.skmt_path and not Path(self.config.skmt.skmt_path).exists():
-            logger.warning(f"SKMT path does not exist: {self.config.skmt.skmt_path}")
-    
-    def _auto_detect_skmt(self) -> Optional[str]:
-        """
-        Auto-detect SKMT executable in multiple locations.
-        
-        Searches for common SKMT executable names in:
-        1. provisioning_tool/security/skmt/app/ (repo folder)
-        2. C:\\Renesas\\SecurityKeyManagementTool\\ (default installation path)
-        3. Common subdirectories (bin, cli, etc.)
-        
-        Returns:
-            Path to SKMT executable if found, None otherwise
-        """
-        # Common SKMT executable names (prioritize CLI over GUI)
-        # Prioritize skmt.exe (CLI) over SecurityKeyManagementTool.exe (GUI)
-        possible_names = [
-            "skmt.exe",  # CLI - highest priority
-            "skmt",  # CLI without extension
-            "SKMT.exe",
-            "SKMT",
-            "SecurityKeyManagementTool.exe",  # GUI - lower priority
-            "SecurityKeyManagementTool",
-        ]
-        
-        # Common subdirectories to search in (prioritize cli folder)
-        # Search CLI subfolder first, then root, then others
-        subdirs = ["cli", "", "bin", "tools", "executable"]
-        
-        # Search locations (in order of priority)
-        search_locations = []
-        
-        # 1. Repo app folder
-        current_file = Path(__file__).resolve()
-        # config/loader.py -> config/ -> root/ -> security/skmt/app
-        skmt_app_dir = current_file.parent.parent / "security" / "skmt" / "app"
-        if skmt_app_dir.exists():
-            search_locations.append(skmt_app_dir)
-        
-        # 2. Default installation path
-        default_install_path = Path("C:/Renesas/SecurityKeyManagementTool")
-        if default_install_path.exists():
-            search_locations.append(default_install_path)
-        
-        # 3. Alternative common installation paths
-        alt_paths = [
-            Path("C:/Program Files/Renesas/SecurityKeyManagementTool"),
-            Path("C:/Program Files (x86)/Renesas/SecurityKeyManagementTool"),
-        ]
-        for alt_path in alt_paths:
-            if alt_path.exists():
-                search_locations.append(alt_path)
-        
-        # Search in each location
-        for search_dir in search_locations:
-            logger.debug(f"Searching for SKMT in: {search_dir}")
-            
-            # First, try subdirectories (prioritize cli folder for CLI executable)
-            for subdir in subdirs:
-                if subdir:
-                    subdir_path = search_dir / subdir
-                    if not subdir_path.exists() or not subdir_path.is_dir():
-                        continue
-                else:
-                    subdir_path = search_dir
-                
-                for name in possible_names:
-                    candidate = subdir_path / name
-                    if candidate.exists() and candidate.is_file():
-                        if name.endswith(".exe") or os.access(candidate, os.X_OK):
-                            logger.info(f"Found SKMT executable in {'subdirectory' if subdir else 'root'}: {candidate}")
-                            return str(candidate)
-        
-        logger.debug("SKMT executable not found in any search location")
-        return None
 
 

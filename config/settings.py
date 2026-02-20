@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
+# Default AWS region for KMS/HSM. Override via project_config.json or AWS_DEFAULT_REGION.
+DEFAULT_AWS_REGION: str = "eu-west-2"
+
 
 @dataclass
 class CommunicationConfig:
@@ -53,22 +56,27 @@ class HSMConfig:
     slot_id: int = 0
     pin: str = ""
     aws_cloudhsm_cluster_id: Optional[str] = None
-    aws_region: str = "eu-central-1"
+    aws_region: str = DEFAULT_AWS_REGION
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     key_label_prefix: str = "renesas_"
-    hsm_type: str = "aws_kms"  # AWS KMS for key management and signing
+    hsm_type: str = "broker"  # AWS KMS for key management and signing
 
 
 @dataclass
 class SKMTConfig:
     """
-    SKMT (Security Key Management Tool) configuration.
+    Legacy configuration for certificate generation working directory.
+
+    Note:
+        SKMT executable is no longer used. All key operations (UFPK, RKEY)
+        are handled natively in Python. This config is retained only for
+        the working_directory used by CertificateGenerator.
 
     Attributes:
-        skmt_path: Path to SKMT executable
-        working_directory: Working directory for SKMT operations
-        log_level: SKMT log level
+        skmt_path: Deprecated - no longer used
+        working_directory: Working directory for certificate generation operations
+        log_level: Log level for certificate operations
     """
 
     skmt_path: str = ""
@@ -167,6 +175,34 @@ class LoggingConfig:
 
 
 @dataclass
+class BrokerConfig:
+    """
+    Crypto broker service configuration.
+
+    Attributes:
+        socket_path: Path to Unix socket (Linux) or Named Pipe name (Windows)
+        policies_file: Path to authorization policies JSON file
+        session_timeout: Session timeout in seconds (0 for no timeout)
+        max_sessions: Maximum concurrent client sessions
+        pid_file: Path to PID file for daemon mode
+        aws_region: AWS region for KMS backend
+        aws_access_key_id: AWS access key (optional, can use env vars)
+        aws_secret_access_key: AWS secret key (optional, can use env vars)
+        key_prefix: Prefix for key aliases in KMS
+    """
+
+    socket_path: Optional[str] = None
+    policies_file: Optional[str] = None
+    session_timeout: float = 3600.0
+    max_sessions: int = 100
+    pid_file: Optional[str] = None
+    aws_region: str = DEFAULT_AWS_REGION
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    key_prefix: str = "renesas_"
+
+
+@dataclass
 class ProvisioningToolConfig:
     """
     Main configuration class for the provisioning tool.
@@ -179,6 +215,7 @@ class ProvisioningToolConfig:
         dlm: DLM server configuration
         firmware: Firmware configuration
         logging: Logging configuration
+        broker: Crypto broker service configuration
         custom: Custom configuration parameters
     """
 
@@ -189,6 +226,7 @@ class ProvisioningToolConfig:
     dlm: DLMConfig = field(default_factory=DLMConfig)
     firmware: FirmwareConfig = field(default_factory=FirmwareConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    broker: BrokerConfig = field(default_factory=BrokerConfig)
     custom: Dict[str, any] = field(default_factory=dict)
 
 

@@ -216,7 +216,6 @@ class RA8CertificateProgrammer:
             logger.error(f"CERTIFICATE DATA REJECTED: STS=0x{sts:02X}")
             
             if sts == 0xDC:
-                # Certificate version error - user needs to increase version
                 logger.error("")
                 logger.error("="*70)
                 logger.error("CERTIFICATE VERSION ERROR (0xDC)")

@@ -10,13 +10,13 @@ Bare Metal Practical Guide - RA8M1"
 This package provides functionality for:
 - Device communication via USB and UART using Renesas Boot Firmware protocol
 - Firmware programming and verification (bootloader and application)
-- Cryptographic key provisioning via HSM (AWS KMS)
+- Cryptographic key provisioning via HSM (PKCS#11, AWS KMS, ...)
 - Certificate management and provisioning (Key Certificate, Code Certificate)
 - Secure firmware signing using HSM
 - Production-level provisioning workflows
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __author__ = "Crypto Quantique"
 __work_package__ = "Secure Boot - Bare Metal Practical Guide - RA8M1"
 

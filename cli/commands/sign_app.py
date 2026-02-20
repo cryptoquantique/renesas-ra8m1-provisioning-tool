@@ -156,13 +156,19 @@ def sign_app_command(
             click.echo(f"Mode:          DEVELOPMENT (local keys allowed for imgtool)")
         click.echo("")
         
-        # Sign with AWS KMS
+        # Get HSM type from project config or use default from settings
+        hsm_type = getattr(proj_config, 'hsm_type', None) or HSMConfig().hsm_type
+
+        # Sign with HSM backend
         click.echo("-"*70)
-        click.echo("Signing with AWS KMS...")
+        if hsm_type == "broker":
+            click.echo("Signing via PKCS#11 Broker → AWS KMS...")
+        else:
+            click.echo(f"Signing via {hsm_type}...")
         click.echo("-"*70)
-        
+
         hsm_config = HSMConfig(
-            hsm_type="aws_kms",
+            hsm_type=hsm_type,
             aws_region=proj_config.aws_region,
             aws_access_key_id=proj_config.aws_access_key_id,
             aws_secret_access_key=proj_config.aws_secret_access_key
@@ -186,20 +192,29 @@ def sign_app_command(
             allow_local_temp_keys=not production,
         )
 
+        # Customer public key is already saved by sign_image_with_aws_kms
         customer_pk_pem = output_dir / "customer_public.pem"
-        hsm_client = create_hsm_client(hsm_config)
-        hsm_client.connect()
-        customer_pk_der = hsm_client.get_public_key(kms_key_id)
-        hsm_client.disconnect()
-        save_public_key_pem(customer_pk_der, customer_pk_pem, KeyCurve.SECP256R1)
-        click.echo(f"\n[OK] Customer public key saved: {customer_pk_pem}")
+        if customer_pk_pem.exists():
+            click.echo(f"\n[OK] Customer public key: {customer_pk_pem}")
+        else:
+            # Fallback: fetch public key if not already saved
+            hsm_client = create_hsm_client(hsm_config)
+            hsm_client.connect()
+            customer_pk_der = hsm_client.get_public_key(kms_key_id)
+            hsm_client.disconnect()
+            save_public_key_pem(customer_pk_der, customer_pk_pem, KeyCurve.SECP256R1)
+            click.echo(f"\n[OK] Customer public key saved: {customer_pk_pem}")
         
         click.echo(f"\n{'='*70}")
         click.echo(f"[OK] APPLICATION SIGNED SUCCESSFULLY")
         click.echo(f"{'='*70}")
         click.echo(f"\nOutput: {out}")
         click.echo(f"Size:   {out.stat().st_size} bytes")
-        click.echo(f"\nNext step: Run 'gen-fsbl-certs' to generate certificates")
+        click.echo(f"\nNext steps:")
+        click.echo(f"  1. invoke make-combined-srec  # Combine bootloader + signed app")
+        click.echo(f"  2. invoke gen-fsbl-certs      # Generate FSBL certificates")
+        click.echo(f"  3. invoke program-device      # Flash to device")
+        click.echo(f"\n  Or run all at once: invoke workflow-all")
         
     except ConfigError as e:
         click.echo(f"\n[ERROR] Configuration error: {e}", err=True)

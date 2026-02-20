@@ -15,13 +15,11 @@ import click
 
 from utils.project_config import get_project_config
 from utils.flow_manager import get_current_flow
-from utils.exceptions import ConfigError, DeviceError, SKMTError
+from utils.exceptions import ConfigError, DeviceError
 from utils.logging import get_logger
-from config.loader import ConfigLoader
-from config.settings import HSMConfig, SKMTConfig
+from config.settings import HSMConfig
 from security.hsm.factory import create_hsm_client
 from security.key_utils import save_public_key_pem, KeyCurve
-from security.skmt.wrapper import SKMTWrapper
 
 logger = get_logger(__name__)
 
@@ -78,9 +76,10 @@ def generate_rkey_command(
     \b
     Next Steps:
         After RKEY generation:
-        1. invoke gen-fsbl-certs     # Generate certificates
-        2. invoke make-combined-srec # Combine bootloader + app
-        3. invoke program-device     # Program device with RKEY + certs
+        1. invoke sign-app            # Sign application with AWS KMS
+        2. invoke make-combined-srec  # Combine bootloader + signed app
+        3. invoke gen-fsbl-certs      # Generate FSBL certificates
+        4. invoke program-device      # Flash to device
     """
     click.echo("="*70)
     click.echo("GENERATE-RKEY: Wrap OEM Root Public Key")
@@ -214,7 +213,7 @@ def generate_rkey_command(
             
             # Create HSM config
             hsm_config = HSMConfig(
-                hsm_type="aws_kms",
+                hsm_type=proj_config.hsm_type,  # Use config (broker or aws_kms)
                 aws_region=proj_config.aws_region,
                 aws_access_key_id=proj_config.aws_access_key_id,
                 aws_secret_access_key=proj_config.aws_secret_access_key
@@ -259,76 +258,31 @@ def generate_rkey_command(
                     break
             
             if not rkey_found:
-                # Generate new RKEY with SKMT
+                # Generate new RKEY using native Python (AES-CBC + CBC-MAC)
                 click.echo("No existing RKEY found. Generating new RKEY...")
-                click.echo("")
-                click.echo("[WARNING] SKMT.exe requires device definition files!")
-                click.echo("[WARNING] If SKMT fails, you can:")
-                click.echo("  1. Run SKMT manually from its installation folder")
-                click.echo("  2. Copy generated RKEY to: output/reuse_ufpk/oem_root_key.rkey")
-                click.echo("  3. Re-run this command to use the copied RKEY")
+                click.echo("[INFO] Using native Python RKEY generator (AES-CBC + CBC-MAC)")
                 click.echo("")
                 
                 try:
-                    # Load SKMT path from config (auto-detects if not configured)
-                    config_loader = ConfigLoader()
-                    tool_config = config_loader.load()
-                    
-                    # Use configured SKMT path, or auto-detect if not set
-                    skmt_path = tool_config.skmt.skmt_path
-                    if not skmt_path or not Path(skmt_path).exists():
-                        # Auto-detect SKMT
-                        detected_path = config_loader._auto_detect_skmt()
-                        if detected_path:
-                            skmt_path = str(detected_path)
-                            click.echo(f"[INFO] Auto-detected SKMT: {skmt_path}")
-                        else:
-                            click.echo("[ERROR] SKMT not found and not configured!", err=True)
-                            click.echo("[TIP] Install Renesas SKMT and set 'skmt.skmt_path' in config.yaml", err=True)
-                            click.echo("[TIP] Or configure 'paths.skmt_path' in project_config.json", err=True)
-                            sys.exit(1)
-                    
-                    # Create SKMT config
-                    skmt_config = SKMTConfig(
-                        skmt_path=Path(skmt_path),
-                        working_directory=flow_folder / "skmt_work"
+                    from security.skmt.native_rkey_generator import generate_rkey_from_files
+                    # Needs BOTH plain UFPK (32 bytes) and wrapped UFPK (36 bytes)
+                    generate_rkey_from_files(
+                        oem_root_pk_file=oem_root_pk_file,
+                        ufpk_file=plain_ufpk_path,
+                        output_file=rkey_path,
+                        w_ufpk_file=wrapped_ufpk_path,
                     )
-                    
-                    skmt_wrapper = SKMTWrapper(
-                        skmt_path=skmt_config.skmt_path,
-                        working_directory=skmt_config.working_directory,
-                    )
-                    
-                    oem_root_pk_bytes = oem_root_pk_file.read_bytes()
-                    skmt_wrapper.wrap_oem_root_public_key(
-                        oem_root_pk=oem_root_pk_bytes,
-                        ufpk=str(wrapped_ufpk_path),
-                        plain_ufpk=str(plain_ufpk_path),
-                        output_file=str(rkey_path),
-                    )
-                    
                     click.echo(f"[OK] RKEY generated: {rkey_path.name}")
                     click.echo(f"    Size: {rkey_path.stat().st_size} bytes")
-                
-                except SKMTError as e:
-                    click.echo(f"\n[ERROR] SKMT failed to generate RKEY: {e}", err=True)
-                    click.echo("\n" + "="*70, err=True)
-                    click.echo("WORKAROUND: Generate RKEY manually", err=True)
-                    click.echo("="*70, err=True)
-                    click.echo("\nOption 1: Use SKMT from installation folder:", err=True)
-                    click.echo(f"  1. Copy {oem_root_pk_file} to SKMT folder", err=True)
-                    click.echo(f"  2. Copy {wrapped_ufpk_path} to SKMT folder", err=True)
-                    click.echo(f"  3. Copy {plain_ufpk_path} to SKMT folder", err=True)
-                    click.echo("  4. Run:", err=True)
-                    click.echo("     skmt.exe /genkey /mcu RA-RSIP-E51A /keytype OEM_ROOT_PK \\", err=True)
-                    click.echo("         /filetype rfp /key file=oem_root_public.pem \\", err=True)
-                    click.echo("         /ufpk file=ufpk.key /wufpk file=ufpk_wrapped_decrypted.key \\", err=True)
-                    click.echo("         /output oem_root_key.rkey", err=True)
-                    click.echo(f"  5. Copy oem_root_key.rkey to: {rkey_path}", err=True)
-                    click.echo("\nOption 2: Use existing RKEY:", err=True)
-                    click.echo("  - Place your RKEY at: output/reuse_ufpk/oem_root_key.rkey", err=True)
-                    click.echo("  - Or in any previous flow folder", err=True)
-                    click.echo("")
+                except Exception as e:
+                    click.echo(f"\n[ERROR] RKEY generation failed: {e}", err=True)
+                    click.echo("\nPlease check:", err=True)
+                    click.echo(f"  - OEM Root PK file: {oem_root_pk_file}", err=True)
+                    click.echo(f"  - UFPK file: {wrapped_ufpk_path}", err=True)
+                    click.echo("  - Both files must exist and be valid", err=True)
+                    click.echo("\nAlternative: Place an existing .rkey file at:", err=True)
+                    click.echo(f"  - {rkey_path}", err=True)
+                    click.echo("  - output/reuse_ufpk/oem_root_key.rkey", err=True)
                     sys.exit(1)
         
         # === Step 4: Move UFPK to reusable folder (cleanup) ===
@@ -374,9 +328,11 @@ def generate_rkey_command(
         click.echo("="*70)
         click.echo(f"\nOutput: {rkey_path}")
         click.echo("\nNext steps:")
-        click.echo("  1. invoke gen-fsbl-certs     # Generate Key + Code Certificates")
-        click.echo("  2. invoke make-combined-srec # Combine bootloader + app")
-        click.echo("  3. invoke program-device     # Program device")
+        click.echo("  1. invoke sign-app            # Sign application with AWS KMS")
+        click.echo("  2. invoke make-combined-srec  # Combine bootloader + signed app")
+        click.echo("  3. invoke gen-fsbl-certs      # Generate FSBL certificates")
+        click.echo("  4. invoke program-device      # Flash to device")
+        click.echo(f"\n  Or run steps 1-3 at once: invoke workflow-all")
         click.echo("")
         
     except ConfigError as e:

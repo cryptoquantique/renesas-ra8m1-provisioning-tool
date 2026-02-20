@@ -122,75 +122,14 @@ def generate_rkey(ctx, oem_root_key_id=None):
     _run_workflow_command(ctx, 'generate-rkey', oem_root_key_id=oem_root_key_id)
 
 
-@task
-def generate_certs(ctx, oem_root_key_id=None, oem_bl_key_id=None):
-    """
-    Step 6: Generate Key Certificate and Code Certificate.
-    
-    Options:
-        --oem-root-key-id: AWS KMS Key ID for OEM Root key (for Key Cert).
-        --oem-bl-key-id: AWS KMS Key ID for OEM Bootloader key (for Code Cert).
-    """
-    _run_workflow_command(ctx, 'generate-certs', oem_root_key_id=oem_root_key_id, oem_bl_key_id=oem_bl_key_id)
-
-
-@task(name="prepare-all-keys")
-def prepare_all_keys(ctx, oem_root_key_id=None, oem_bl_key_id=None, bootloader_binary=None):
-    """
-    Combined: Generate RKEY + Key Certificate + Code Certificate in one command.
-    
-    Uses existing flow folder (no new timestamp folder created).
-    Skips files that already exist.
-    
-    Options:
-        --oem-root-key-id: AWS KMS Key ID for OEM Root key.
-        --oem-bl-key-id: AWS KMS Key ID for OEM Bootloader key.
-        --bootloader-binary: Path to bootloader binary (.srec).
-    """
-    _run_workflow_command(
-        ctx, 
-        'prepare-all-keys', 
-        oem_root_sk_key_id=oem_root_key_id, 
-        oem_bl_sk_key_id=oem_bl_key_id,
-        bootloader_binary=bootloader_binary
-    )
-
-
-@task(name="sign-app-old")
-def sign_app_old(ctx, app_srec=None, bootloader_srec=None, app_offset="0x02010000", oem_bl_key_id=None):
-    """
-    [LEGACY] Old sign-app workflow (combines multiple steps).
-    
-    DEPRECATED: Use 'invoke sign-app' for the new refactored workflow.
-    
-    Flow:
-    1. Sign app.srec → application.bin.signed
-    2. Offset addresses → app_signed_offset.srec  
-    3. Concatenate with bootloader → combined.srec
-    
-    Options:
-        --app-srec: Path to application SREC file. If not provided, will prompt.
-        --bootloader-srec: Path to bootloader SREC file. If not provided, will search or prompt.
-        --app-offset: Application start address offset (default: 0x02010000).
-        --oem-bl-key-id: AWS KMS Key ID for OEM Bootloader key.
-    """
-    _run_workflow_command(
-        ctx, 
-        'sign-app', 
-        app_srec=app_srec,
-        bootloader_srec=bootloader_srec,
-        app_offset=app_offset,
-        oem_bl_sk_key_id=oem_bl_key_id
-    )
-
 
 @task(name="sign-app")
 def sign_app(ctx, app_bin=None, kms_key_id=None, version=None, out=None, config=None, production=False):
     """
-    Sign MCUboot APPLICATION with AWS KMS.
+    Sign MCUboot application with HSM backend (PKCS#11 Broker or AWS KMS direct).
     
     Steps:
-    1. Sign application binary with AWS KMS
+    1. Sign application binary via configured HSM backend
     2. Produce MCUboot-format signed binary (app.bin.signed)
     
     Options:
@@ -239,12 +178,6 @@ def generate_rkey(ctx, oem_root_key_id=None, config=None):
         1. Run 'invoke prepare-ufpk' first to get UFPK
         2. Have OEM Root Key in AWS KMS
     
-    Steps:
-        1. Check UFPK exists (wrapped + plain)
-        2. Export OEM Root PK from AWS KMS
-        3. Wrap OEM Root PK with UFPK → RKEY
-        4. Save RKEY to flow folder
-    
     Options:
         --oem-root-key-id: AWS KMS Key ID for OEM Root key
         --config: Path to project_config.json
@@ -255,9 +188,11 @@ def generate_rkey(ctx, oem_root_key_id=None, config=None):
     
     Next Steps:
         After RKEY generation:
-        1. invoke gen-fsbl-certs     # Generate certificates
-        2. invoke make-combined-srec # Combine bootloader + app
-        3. invoke program-device     # Program device with RKEY + certs
+        1. invoke sign-app            # Sign application with AWS KMS
+        2. invoke make-combined-srec  # Combine bootloader + signed app
+        3. invoke gen-fsbl-certs      # Generate FSBL certificates
+        4. invoke program-device      # Flash to device
+        Or run steps 1-3 at once: invoke workflow-all
     """
     python_exe = sys.executable
     cmd_parts = [python_exe, '-m', 'cli', 'generate-rkey']
@@ -393,15 +328,18 @@ def make_combined_srec(ctx, bootloader_srec=None, app_signed_bin=None, app_offse
 @task(name="workflow-all")
 def workflow_all(ctx, config=None):
     """
-    Complete workflow: sign-app -> make-combined-srec -> gen-fsbl-certs.
+    Complete workflow: generate-rkey -> sign-app -> make-combined-srec -> gen-fsbl-certs.
     
-    CORRECT ORDER (Renesas requirement):
+    Steps:
+    0. generate-rkey: Generate RKEY (skipped if already exists)
     1. sign-app: Sign application with AWS KMS (MCUboot format)
     2. make-combined-srec: Combine bootloader + signed app
     3. gen-fsbl-certs: Generate certificates WITH combined.srec for CRC!
     
-    CRITICAL: Certificates MUST be generated AFTER combined.srec because
-    FSBL calculates CRC on the entire 192KB region (bootloader + app).
+    Prerequisites:
+        - Run 'invoke prepare-ufpk' first (one-time per device type)
+        - bootloader.srec and application.bin in prerequisites/
+        - AWS KMS keys configured in project_config.json
     
     After this, use 'invoke program-device' to flash to device.
     
@@ -409,7 +347,7 @@ def workflow_all(ctx, config=None):
         --config: Path to project_config.json (recommended)
     
     Example:
-        invoke workflow-all --config project_config.json
+        invoke workflow-all
     """
     import json
     from pathlib import Path
@@ -425,29 +363,55 @@ def workflow_all(ctx, config=None):
     print("\n" + "="*70)
     print("STARTING COMPLETE PROVISIONING WORKFLOW")
     print("="*70)
-    print("Order: sign-app -> make-combined-srec -> gen-fsbl-certs")
+    print("Order: generate-rkey -> sign-app -> make-combined-srec -> gen-fsbl-certs")
     print("-"*70)
     
     # Display key injection mode prominently
     if inject_customer_key:
-        print("[KEY MODE] INJECT AWS KMS CUSTOMER KEY into bootloader")
-        print("           Bootloader will verify apps signed with YOUR key")
+        print("[KEY MODE] INJECT CUSTOMER KEY into bootloader")
+        print("           MCUboot will verify apps signed with YOUR AWS KMS key")
     else:
         print("[KEY MODE] KEEP ORIGINAL RENESAS DEMO KEY in bootloader")
         print("           Bootloader will verify apps signed with Renesas demo key")
     print("="*70 + "\n")
     
+    # Step 0: Generate RKEY (if not already present)
+    output_dir = Path(cfg.get("paths", {}).get("output_dir", "output"))
+    flow_dirs = sorted(
+        [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("flow_")],
+        key=lambda d: d.stat().st_mtime,
+        reverse=True
+    )
+    
+    if not flow_dirs:
+        print("[ERROR] No flow directory found! Run 'invoke prepare-ufpk' first.")
+        sys.exit(1)
+    
+    flow_folder = flow_dirs[0]
+    rkey_path = flow_folder / "oem_root_key.rkey"
+    
+    # Also check reusable folder
+    reusable_rkey = output_dir / "reusable" / "oem_root_key.rkey"
+    
+    if rkey_path.exists():
+        print(f"Step 0: RKEY already exists: {rkey_path.name} (skipping)")
+    elif reusable_rkey.exists():
+        import shutil
+        shutil.copy2(reusable_rkey, rkey_path)
+        print(f"Step 0: RKEY copied from reusable folder: {rkey_path.name}")
+    else:
+        print("Step 0: Generating RKEY (wrapped OEM Root Public Key)...")
+        generate_rkey(ctx, config=config)
+    
     # Step 1: Sign app
-    print("Step 1: Signing application...")
+    print("\nStep 1: Signing application...")
     sign_app(ctx, config=config)
     
     # Step 2: Make combined SREC (BEFORE certificates!)
     print("\nStep 2: Creating combined SREC...")
     make_combined_srec(ctx, config=config, inject_aws_key=inject_customer_key)
     
-    # Find the latest combined.srec
-    from pathlib import Path
-    output_dir = Path("output")
+    # Re-scan flow dirs to find the combined.srec (may be in a new flow folder)
     flow_dirs = sorted(
         [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("flow_")],
         key=lambda d: d.stat().st_mtime,
@@ -513,7 +477,7 @@ def export_pgp_public_key(ctx, output=None):
 @task
 def help(ctx):
     """Show workflow help."""
-    _run_workflow_command(ctx, '--help')
+    _run_workflow_command(ctx, 'cli-help')
 
 
 @task(name="cli-help")
@@ -565,13 +529,20 @@ def generate_docs(ctx, diagrams=False, html=True):
     print("\n" + "="*70)
     print("GENERATING DOCUMENTATION")
     print("="*70)
+
+    repo_root = Path(__file__).parent.parent
+    sphinx_source = repo_root / "doc" / "source"
+    sphinx_build = repo_root / "doc" / "_build"
     
-    docs_dir = Path("docs")
+    if not sphinx_source.exists():
+        print(f"[ERROR] Sphinx source directory not found: {sphinx_source}")
+        print(f"  Expected at: {sphinx_source.absolute()}")
+        sys.exit(1)
     
     if diagrams:
         print("\n[1/2] Generating class diagrams...")
-        diagrams_dir = docs_dir / "diagrams"
-        diagrams_dir.mkdir(exist_ok=True)
+        diagrams_dir = sphinx_build / "diagrams"
+        diagrams_dir.mkdir(parents=True, exist_ok=True)
         
         modules = [
             ("cli/commands", "CLI"),
@@ -596,15 +567,14 @@ def generate_docs(ctx, diagrams=False, html=True):
         step = "2/2" if diagrams else "1/1"
         print(f"\n[{step}] Building Sphinx HTML documentation...")
         
-        build_dir = docs_dir / "_build"
         result = subprocess.run(
             [sys.executable, "-m", "sphinx", "-b", "html", 
-             str(docs_dir), str(build_dir / "html")],
+             str(sphinx_source), str(sphinx_build / "html")],
             capture_output=True, text=True
         )
         
         if result.returncode == 0:
-            print(f"  HTML docs saved to: {build_dir / 'html'}")
+            print(f"  HTML docs saved to: {sphinx_build / 'html'}")
         else:
             print(f"  [WARN] Sphinx build had issues:")
             if result.stderr:
@@ -616,5 +586,5 @@ def generate_docs(ctx, diagrams=False, html=True):
     print("\n" + "="*70)
     print("[OK] DOCUMENTATION GENERATED")
     print("="*70)
-    print(f"\nTo view: start docs\\_build\\html\\index.html")
+    print(f"\nTo view: start {sphinx_build / 'html' / 'index.html'}")
     print("")

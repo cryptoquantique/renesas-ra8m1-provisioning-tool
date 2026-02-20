@@ -1,10 +1,7 @@
 {
-  "_comment": "Renesas RA8M1 Provisioning Tool - Configuration",
-  "_comment2": "Config auto-detected - no need to pass --config explicitly.",
-  
   "project": {
     "name": "Renesas RA8M1 Secure Boot Provisioning",
-    "version": "1.0.0"
+    "version": "1.2.0"
   },
   
   "dlm": {
@@ -18,6 +15,8 @@
     "access_key_id": "",
     "secret_access_key": "",
     "region": "",
+    "hsm_type": "broker",
+    "_comment_hsm": "hsm_type: 'broker' (recommended, auto-starts daemon) or 'aws_kms' (direct access)",
     "kms": {
       "oem_root_key_id": "",
       "oem_bootloader_key_id": "",
@@ -26,11 +25,10 @@
   },
   
   "paths": {
-    "bootloader_srec": "prerequisites/bootloader.srec",
-    "application_bin": "prerequisites/app.bin",
+    "bootloader_srec": "prerequisites/mcuboot_ra8m1.srec",
+    "application_bin": "prerequisites/app_ra8m1.bin",
     "output_dir": "output",
-    "srec_cat_exe": "C:/Program Files/srecord/bin/srec_cat.exe",
-    "skmt_path": "C:/Renesas/SecurityKeyManagementTool/cli/skmt.exe"
+    "srec_cat_exe": "C:/Program Files/srecord/bin/srec_cat.exe"
   },
   
   "firmware": {
@@ -92,8 +90,33 @@
   
   "device": {
     "type": "ra8m1",
-    "interface": "rfp",
+    "interface": "serial",
     "com_port": null,
     "lock_after_provisioning": false
+  },
+
+  "broker": {
+    "enabled": true,
+    "transport": "named_pipe",
+    "pipe_name": "\\\\.\\pipe\\crypto_broker",
+    "policies_file": "security/broker/config/broker_policies_windows.json",
+    "log_level": "INFO",
+    "log_file": null,
+    "session_timeout": 3600,
+    "max_sessions": 100
+  },
+
+  "service": {
+    "name": "CryptoBroker",
+    "display_name": "Crypto Broker Service",
+    "description": "PKCS#11 broker for AWS KMS cryptographic operations",
+    "start_type": "auto",
+    "recovery": {
+      "first_failure": "restart",
+      "second_failure": "restart",
+      "subsequent_failures": "restart",
+      "reset_period_days": 1,
+      "restart_delay_ms": 5000
+    }
   }
 }

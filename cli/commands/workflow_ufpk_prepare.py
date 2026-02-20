@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Optional
 
 from config.loader import ConfigLoader
-from security.skmt.wrapper import SKMTWrapper
 from security.dlm.client import DLMClient
 from security.pgp.client import PGPClient
 from utils.exceptions import DLMError, PGPError, SKMTError
@@ -217,23 +216,18 @@ def prepare_ufpk(ctx, ufpk_hardcoded: Optional[str], ufpk_file: Optional[Path]):
                 click.echo(f"   [ERROR] Hardcoded UFPK must be 64 hex characters, got {len(ufpk_hex)}", err=True)
                 sys.exit(1)
             ufpk_path = flow_folder / "ufpk.key"
-            skmt_wrapper = SKMTWrapper(
-                skmt_path=config.skmt.skmt_path,
-                working_directory=config.skmt.working_directory,
-            )
-            ufpk_path = Path(skmt_wrapper.generate_ufpk(ufpk_hex=ufpk_hex, output_file=str(ufpk_path)))
+            ufpk_bytes = bytes.fromhex(ufpk_hex)
+            ufpk_path.write_bytes(ufpk_bytes)
             click.echo(f"   [+] UFPK generated (hardcoded): {ufpk_path.name}")
         else:
+            import os as _os
             # Default: Generate RANDOM UFPK (256-bit = 32 bytes = 64 hex chars)
             # Per Renesas documentation: "Generate UFPK (256-bit random or specified value)"
             # Reference: r11an0785eu0100 Section 4.2, r11an0496eu0220 Section 3.1
             ufpk_path = flow_folder / "ufpk.key"
-            skmt_wrapper = SKMTWrapper(
-                skmt_path=config.skmt.skmt_path,
-                working_directory=config.skmt.working_directory,
-            )
-            # Call without ufpk_hex parameter → SKMT generates random
-            ufpk_path = Path(skmt_wrapper.generate_ufpk(output_file=str(ufpk_path)))
+            # Generate random 256-bit key using Python (no SKMT needed)
+            ufpk_bytes = _os.urandom(32)
+            ufpk_path.write_bytes(ufpk_bytes)
             click.echo(f"   [+] UFPK generated (RANDOM 256-bit): {ufpk_path.name}")
         
         click.echo(f"   [FILE] Saved to: {ufpk_path.absolute()}\n")
@@ -695,7 +689,9 @@ def prepare_ufpk(ctx, ufpk_hardcoded: Optional[str], ufpk_file: Optional[Path]):
         click.echo(f"  • Wrapped UFPK (from email): {wrapped_file_path.name}")
     if decrypted_file.exists():
         click.echo(f"  • Decrypted wrapped UFPK: {decrypted_file.name}")
-    click.echo("\n[TIP] Next step: Run 'invoke prepare-all-keys' to generate RKEY and certificates")
-    click.echo("          Or run individual steps: 'invoke generate-rkey' -> 'invoke generate-certs'")
+    click.echo("\n[TIP] Next steps:")
+    click.echo("  1. invoke generate-rkey       # Wrap OEM Root PK with UFPK")
+    click.echo("  2. invoke workflow-all        # Sign app + combine SREC + generate certificates")
+    click.echo("  3. invoke program-device      # Flash to device")
     click.echo("")
 

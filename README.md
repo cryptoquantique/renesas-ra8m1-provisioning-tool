@@ -1,6 +1,6 @@
 # RA8M1 Provisioning Tool
 
-A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot secure boot. This tool provides end-to-end automation for device provisioning including key management via AWS KMS, certificate generation, firmware signing, and device programming.
+A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot secure boot. This tool provides end-to-end automation for device provisioning including key management via AWS KMS (through a PKCS#11 Crypto Broker for credential isolation), certificate generation, firmware signing, and direct serial/USB device programming.
 
 ---
 
@@ -13,13 +13,14 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
 
     +------------------+         +------------------+         +------------------+
     |   AWS KMS        |         |   PREREQUISITES  |         |   OUTPUT         |
-    |------------------|         |------------------|         |------------------|
-    | - OEM Root SK    |         | - bootloader.srec|         | - combined.srec  |
-    | - OEM BL SK      |         | - application.bin|         | - key_cert.bin   |
-    | - Customer SK    |         | - project_config |         | - code_cert.bin  |
-    +--------+---------+         +--------+---------+         +--------+---------+
-             |                            |                            ^
-             v                            v                            |
+    |  (via PKCS#11    |         |------------------|         |------------------|
+    |   Crypto Broker) |         | - bootloader.srec|         | - combined.srec  |
+    |------------------|         | - application.bin|         | - key_cert.bin   |
+    | - OEM Root SK    |         | - project_config |         | - code_cert.bin  |
+    | - OEM BL SK      |         +--------+---------+         +--------+---------+
+    | - Customer SK    |                  |                            ^
+    +--------+---------+                  |                            |
+             |                            v                            |
     +--------+----------------------------+----------------------------+--------+
     |                                                                           |
     |   +-----------------+    +-----------------+    +-----------------+       |
@@ -167,15 +168,20 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
    - [Programming Procedure](#33-programming-procedure)
    - [Reset Procedure](#34-reset-procedure)
 
-4. [Troubleshooting](#4-troubleshooting)
-   - [Common Errors](#41-common-errors)
-   - [Verification Commands](#42-verification-commands)
-   - [Debug Procedures](#43-debug-procedures)
+4. [PKCS#11 Crypto Broker](#4-pkcs11-crypto-broker)
+   - [Architecture](#41-architecture)
+   - [Broker Commands](#42-broker-commands)
+   - [Windows Service](#43-windows-service)
 
-5. [API Documentation](#5-api-documentation)
-   - [Generating Documentation](#51-generating-documentation)
-   - [Documentation Structure](#52-documentation-structure)
-   - [Class Diagrams](#53-class-diagrams)
+5. [Troubleshooting](#5-troubleshooting)
+   - [Common Errors](#51-common-errors)
+   - [Verification Commands](#52-verification-commands)
+   - [Debug Procedures](#53-debug-procedures)
+
+6. [API Documentation](#6-api-documentation)
+   - [Generating Documentation](#61-generating-documentation)
+   - [Documentation Structure](#62-documentation-structure)
+   - [Class Diagrams](#63-class-diagrams)
 
 ---
 
@@ -184,8 +190,8 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
 ### 1.1 System Requirements
 
 #### Operating System
-- Windows 10/11 (64-bit)
-- Linux and macOS are not supported
+- Windows 10/11 (64-bit) - Primary supported platform
+- Linux support available (all operations use native Python)
 
 #### Hardware
 - Renesas EK-RA8M1 evaluation board (or compatible RA8M1 device)
@@ -196,8 +202,6 @@ A secure provisioning solution for Renesas RA8M1 microcontrollers with MCUboot s
 - Python 3.10 or later
 - AWS CLI v2
 - GnuPG 2.4 or later (Gpg4win recommended)
-- Renesas Security Key Management Tool (SKMT) 1.1.1 or later
-- Renesas Flash Programmer (RFP) 3.12 or later
 
 ---
 
@@ -220,16 +224,15 @@ python -m venv .venv
 #### Step 3: Install Python Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
-This installs:
+This installs the project and its dependencies (see `pyproject.toml`), including:
 - `click` - Command-line interface framework
 - `invoke` - Task execution framework
 - `boto3` - AWS SDK for Python
 - `cryptography` - Cryptographic operations
 - `pyserial` - Serial communication
-- `python-gnupg` - GnuPG wrapper
 
 #### Step 4: Install External Tools
 
@@ -243,16 +246,6 @@ This installs:
 2. Install MSI package
 3. Verify: `aws --version`
 
-**Renesas SKMT:**
-1. Download from Renesas website (requires registration)
-2. Install to default path: `C:\Renesas\SecurityKeyManagementTool\`
-3. Verify: `"C:\Renesas\SecurityKeyManagementTool\cli\skmt.exe" /?`
-
-**Renesas Flash Programmer (RFP):**
-1. Download from Renesas website
-2. Install with default settings
-3. Verify by launching RFP GUI
-
 #### Step 5: Verify Installation
 
 ```bash
@@ -265,7 +258,9 @@ You should see all available commands listed.
 
 ### 1.3 AWS Configuration
 
-The provisioning tool uses AWS Key Management Service (KMS) for secure key storage and signing operations. Private keys never leave the AWS HSM.
+The provisioning tool uses AWS Key Management Service (KMS) for secure key storage and signing operations, accessed through the **PKCS#11 Crypto Broker** - a local security daemon that provides credential isolation. Private keys never leave the AWS HSM.
+
+> **PKCS#11 Crypto Broker:** AWS credentials are stored only in the broker daemon process, never in the provisioning tool itself. The broker auto-starts when cryptographic operations are requested. Communication uses Named Pipes (Windows) or Unix Sockets (Linux) with JSON-RPC 2.0 protocol.
 
 #### 1.3.1 Create AWS IAM User
 
@@ -295,23 +290,39 @@ The provisioning tool uses AWS Key Management Service (KMS) for secure key stora
 
 5. Save the Access Key ID and Secret Access Key
 
-#### 1.3.2 Create Environment File
+#### 1.3.2 Configure AWS Credentials
 
-Create a `.env` file in the `provisioning_tool` directory:
+AWS credentials are loaded by the PKCS#11 Crypto Broker in this priority order:
 
-```bash
-# AWS Credentials
-AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
-AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-AWS_DEFAULT_REGION=eu-west-2
+1. **`project_config.json`** (recommended) - `aws.access_key_id` and `aws.secret_access_key` fields
+2. **Environment variables** - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+3. **AWS CLI default profile** - configured via `aws configure`
+
+**Option A: In project_config.json (recommended):**
+```json
+{
+  "aws": {
+    "access_key_id": "AKIAXXXXXXXXXXXXXXXX",
+    "secret_access_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "region": "eu-west-2",
+    "hsm_type": "broker"
+  }
+}
 ```
 
-The tool reads credentials from this file automatically. The file is excluded from version control via `.gitignore`.
+**Option B: Environment variables:**
+```bash
+set AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX
+set AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+set AWS_DEFAULT_REGION=eu-west-2
+```
 
-**Alternative:** Use AWS CLI configuration:
+**Option C: AWS CLI configuration:**
 ```bash
 aws configure
 ```
+
+> **Security Note:** The Crypto Broker isolates credentials from the provisioning tool process. AWS access keys exist only in the broker daemon memory.
 
 #### 1.3.3 Create AWS KMS Keys
 
@@ -394,48 +405,76 @@ Copy or modify the existing file: [project_config.json](./project_config.json)
 
 ```json
 {
-    "project_name": "Renesas RA8M1 Secure Boot Provisioning",
-    "version": "1.0.0",
-    
-    "aws": {
-        "region": "eu-west-2",
-        "kms": {
-            "oem_root_key_id": "3ce24d75-caec-4ba9-b10a-38f7c3ff6dc0",
-            "oem_bootloader_key_id": "dc603d76-09dd-48ec-bc24-ae0c033746cf",
-            "mcuboot_app_key_id": "2f6a02f8-2fc9-4592-b22a-ed86ba1d0ed9"
-        }
-    },
-    
-    "paths": {
-        "bootloader_srec": "prerequisites/bootloader.srec",
-        "application_bin": "prerequisites/application.bin",
-        "output_dir": "output"
-    },
-    
-    "firmware": {
-        "inject_customer_key": true,
-        "mcuboot_pubkey_addr": "0x02009114",
-        "app_offset": "0x02010000"
-    },
-    
-    "certificates": {
-        "load_addr": "0x02000000",
-        "oembl_size": "0x00030000",
-        "cfsize": "0x200000"
-    },
-    
-    "versioning": {
-        "certificate_version": 23,
-        "app_version": "1.0.0"
-    },
-    
-    "imgtool": {
-        "align": 128,
-        "header_size": 512,
-        "slot_size": 131072,
-        "pad_header": true,
-        "confirm": true
+  "project": {
+    "name": "Renesas RA8M1 Secure Boot Provisioning",
+    "version": "1.2.0"
+  },
+  
+  "aws": {
+    "access_key_id": "",
+    "secret_access_key": "",
+    "region": "",
+    "hsm_type": "broker",
+    "kms": {
+      "oem_root_key_id": "",
+      "oem_bootloader_key_id": "",
+      "mcuboot_app_key_id": ""
     }
+  },
+  
+  "paths": {
+    "bootloader_srec": "prerequisites/mcuboot_ra8m1.srec",
+    "application_bin": "prerequisites/app_ra8m1.bin",
+    "output_dir": "output"
+  },
+  
+  "firmware": {
+    "app_offset": "0x2010000",
+    "mcuboot_pubkey_addr": "0x02009114",
+    "inject_customer_key": true
+  },
+  
+  "imgtool": {
+    "header_size": "0x200",
+    "align": 128,
+    "max_align": 128,
+    "slot_size": "0x20000",
+    "max_sectors": 4,
+    "version": "1.0.0",
+    "pad_header": true,
+    "pad": true,
+    "confirm": true
+  },
+  
+  "certificates": {
+    "load_addr": "0x02000000",
+    "dest_addr": "0x02000000",
+    "cfsize": "0x200000",
+    "oembl_size": "0x00030000",
+    "mode": "signature",
+    "version": 0,
+    "build_number": 0,
+    "application_version": "1.0.0",
+    
+    "key_certificate": {
+      "magic": "0x6B657963",
+      "manifest_version": "0x00010000",
+      "flags": "0x00000000",
+      "tlv_ecc_pubkey_type_length": "0x00088010",
+      "tlv_keyhash_type_length": "0x10144008",
+      "tlv_expected_sig_type_length": "0x20088410"
+    },
+    
+    "code_certificate": {
+      "magic": "0x636F6463",
+      "manifest_version": "0x00010000",
+      "flags": "0x00000000",
+      "tlv_ecc_pubkey_type_length": "0x01088010",
+      "tlv_expected_crc_type_length": "0x40000001",
+      "tlv_signer_id_type_length": "0x10144008",
+      "tlv_expected_sig_type_length": "0x25088410"
+    }
+  }
 }
 ```
 
@@ -445,7 +484,7 @@ Copy or modify the existing file: [project_config.json](./project_config.json)
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `region` | AWS region where KMS keys are located | `eu-west-2` |
+| `region` | AWS region where KMS keys are located (default: `config.settings.DEFAULT_AWS_REGION`) | e.g. `eu-west-2` |
 | `oem_root_key_id` | Key ID for OEM Root Key (signs Key Certificate) | UUID |
 | `oem_bootloader_key_id` | Key ID for OEM Bootloader Key (signs Code Certificate) | UUID |
 | `mcuboot_app_key_id` | Key ID for MCUboot App Key (signs application) | UUID |
@@ -578,8 +617,8 @@ invoke generate-rkey
 
 **What it does:**
 1. Locates UFPK files (searches flow folders and reuse_ufpk/)
-2. Exports OEM Root Public Key from AWS KMS
-3. Wraps public key with UFPK using SKMT tool
+2. Exports OEM Root Public Key from AWS KMS (via PKCS#11 Crypto Broker)
+3. Wraps public key with UFPK
 4. Saves RKEY to reusable folder
 
 **Prerequisites:**
@@ -730,8 +769,9 @@ All outputs from the three individual commands:
 
 | Data Type | Source | Notes |
 |-----------|--------|-------|
-| AWS credentials | `.env` file or environment variables | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| AWS credentials | `project_config.json` > `aws.*` or environment variables | Loaded by PKCS#11 Crypto Broker |
 | AWS region | `project_config.json` > `aws.region` | Or `AWS_DEFAULT_REGION` env var |
+| HSM type | `project_config.json` > `aws.hsm_type` | `broker` (recommended) or `aws_kms` (direct) |
 | KMS Key IDs | `project_config.json` > `aws.kms.*` | UUID format |
 | Bootloader path | `project_config.json` > `paths.bootloader_srec` | Relative to provisioning_tool/ |
 | Application path | `project_config.json` > `paths.application_bin` | Relative to provisioning_tool/ |
@@ -787,8 +827,8 @@ invoke program-device
 
 **What it does:**
 1. Locates all required files (RKEY, certificates, combined.srec)
-2. Connects to device via Renesas Flash Programmer
-3. Programs OEM Root Key
+2. Connects to device via direct serial/USB communication with boot firmware
+3. Programs OEM Root Key (RKEY)
 4. Programs Key and Code Certificates
 5. Programs combined.srec (bootloader + application)
 
@@ -857,9 +897,94 @@ The device will re-enumerate on USB. The tool handles reconnection automatically
 
 ---
 
-## 4. Troubleshooting
+## 4. PKCS#11 Crypto Broker
 
-### 4.1 Common Errors
+The PKCS#11 Crypto Broker is a security daemon that provides **credential isolation** between the provisioning tool and AWS KMS.
+
+### 4.1 Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Provisioning Tool                      │
+│                                                          │
+│   sign-app / gen-fsbl-certs / make-combined-srec        │
+│              │                                           │
+│              ▼                                           │
+│   ┌──────────────────────┐                              │
+│   │  BrokerHSMClient     │  (PKCS#11 interface)        │
+│   └──────────┬───────────┘                              │
+│              │ Named Pipe (Windows)                      │
+│              │ Unix Socket (Linux)                       │
+│              ▼                                           │
+│   ┌──────────────────────┐                              │
+│   │  Crypto Broker       │  (Daemon process)            │
+│   │  - Holds AWS creds   │                              │
+│   │  - JSON-RPC 2.0      │                              │
+│   │  - Auto-starts       │                              │
+│   └──────────┬───────────┘                              │
+│              │ boto3 (AWS SDK)                           │
+└──────────────┼──────────────────────────────────────────┘
+               ▼
+        ┌──────────────┐
+        │   AWS KMS    │
+        │  (HSM-backed │
+        │   signing)   │
+        └──────────────┘
+```
+
+**Key Benefits:**
+- AWS credentials never exposed to provisioning tool process
+- OS-level authentication (Windows SID / Linux UID)
+- Auto-starts when cryptographic operations are requested
+- Can run as a Windows Service for headless environments
+
+### 4.2 Broker Commands
+
+```bash
+# Start broker in foreground (for development)
+invoke broker-start
+
+# Start broker as background daemon
+invoke broker-start --daemon
+
+# Check broker status
+invoke broker-status
+
+# Stop broker
+invoke broker-stop
+
+# Initialize broker policies
+invoke broker-init-policies
+```
+
+### 4.3 Windows Service
+
+For production or headless environments, the broker can run as a Windows Service:
+
+```bash
+# Install Windows Service
+scripts\install_broker_service.bat
+
+# Start in foreground for testing
+scripts\start_broker_foreground.bat
+
+# Uninstall service
+scripts\uninstall_broker_service.bat
+```
+
+The Windows Service loads AWS credentials from:
+1. `broker_config.json` (if present)
+2. `project_config.json`
+3. System-wide environment variables
+4. AWS CLI default profile
+
+> **Configuration:** Set `"hsm_type": "broker"` in `project_config.json` to use the Crypto Broker (this is the default and recommended setting).
+
+---
+
+## 5. Troubleshooting
+
+### 5.1 Common Errors
 
 #### RKEY Not Found
 
@@ -945,13 +1070,15 @@ invoke workflow-all
 [ERROR] AWS KMS access denied
 ```
 
-**Cause:** AWS credentials invalid or missing KMS permissions.
+**Cause:** AWS credentials invalid or missing KMS permissions, or Crypto Broker cannot access credentials.
 
 **Solution:**
-1. Check `.env` file contains valid credentials:
-   ```
-   AWS_ACCESS_KEY_ID=AKIA...
-   AWS_SECRET_ACCESS_KEY=...
+1. Check `project_config.json` contains valid credentials:
+   ```json
+   "aws": {
+     "access_key_id": "AKIA...",
+     "secret_access_key": "..."
+   }
    ```
 
 2. Verify IAM user has required permissions:
@@ -974,14 +1101,14 @@ invoke workflow-all
 
 **Solution:**
 1. Close all serial terminal applications (PuTTY, TeraTerm, etc.)
-2. Close Renesas Flash Programmer if open
+2. Close any other applications using the COM port
 3. Verify correct COM port in Device Manager
 4. Try a different USB port
 5. Restart the device
 
 ---
 
-### 4.2 Verification Commands
+### 5.2 Verification Commands
 
 #### Verify AWS Configuration
 
@@ -1025,7 +1152,7 @@ Look for these log messages:
 
 ---
 
-### 4.3 Debug Procedures
+### 5.3 Debug Procedures
 
 #### Enable Verbose Logging
 
@@ -1098,110 +1225,3 @@ invoke make-combined-srec --help
 invoke gen-fsbl-certs --help
 invoke program-device --help
 ```
-
----
-
-## 5. API Documentation
-
-This project includes comprehensive API documentation generated from source code docstrings using Sphinx.
-
-### 5.1 Generating Documentation
-
-#### Prerequisites
-
-Install documentation tools (one-time setup):
-
-```bash
-pip install sphinx sphinx-rtd-theme pylint
-```
-
-#### Method 1: Using Invoke Task
-
-```bash
-# Generate HTML documentation only
-invoke generate-docs
-
-# Generate documentation with class diagrams
-invoke generate-docs --diagrams
-```
-
-#### Method 2: Using Sphinx Directly
-
-```bash
-# Navigate to docs folder
-cd docs
-
-# Build HTML documentation
-python -m sphinx -b html . _build/html
-
-# On Windows with make.bat
-make.bat html
-```
-
-#### Method 3: Using Batch Script
-
-```bash
-# Run from provisioning_tool folder
-docs\generate_docs.bat
-```
-
-### 5.2 Documentation Structure
-
-After generation, documentation is located in `docs/_build/html/`:
-
-```
-docs/
-  _build/
-    html/
-      index.html              # Main page (open this)
-      architecture.html       # System architecture overview
-      modules/
-        cli.html              # CLI commands documentation
-        device.html           # Device programming module
-        firmware.html         # Firmware signing module
-        security.html         # Security operations (HSM, SKMT)
-        utils.html            # Utility functions
-        models.html           # Data models
-        config.html           # Configuration module
-      _modules/               # Source code with syntax highlighting
-      genindex.html           # General index
-      search.html             # Search page
-  diagrams/                   # Class diagrams (if generated)
-    classes_ProvisioningTool.dot
-    packages_ProvisioningTool.dot
-```
-
-#### Viewing Documentation
-
-```bash
-# Windows - open in default browser
-start docs\_build\html\index.html
-```
-
-### 5.3 Class Diagrams
-
-Class diagrams are generated using `pyreverse` (part of pylint). Output format is DOT (Graphviz).
-
-#### Generating Diagrams
-
-```bash
-# Generate DOT files
-python -m pylint.pyreverse.main -o dot -p ProvisioningTool cli device firmware security utils models config -d docs\diagrams
-```
-
-#### Converting to PNG (requires Graphviz)
-
-1. Install Graphviz: https://graphviz.org/download/
-2. Add Graphviz to PATH
-3. Convert:
-
-```bash
-dot -Tpng docs\diagrams\classes_ProvisioningTool.dot -o docs\diagrams\classes.png
-dot -Tpng docs\diagrams\packages_ProvisioningTool.dot -o docs\diagrams\packages.png
-```
-
-#### Online DOT Viewer
-
-If Graphviz is not installed, view DOT files online:
-- https://dreampuf.github.io/GraphvizOnline/
-- https://edotor.net/

@@ -16,17 +16,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import boto3
 import click
-from botocore.exceptions import ClientError
 
 from firmware.renesas_key_generator import (
     generate_renesas_compatible_key,
     verify_key_compatibility
 )
 from utils.aws_credentials import load_aws_credentials
-from utils.exceptions import ConfigurationError
+from utils.exceptions import ConfigurationError, HSMError
 from utils.logging import get_logger
+from security.hsm.factory import create_hsm_client
+from models.keys import KeyType, KeyCurve
 
 logger = get_logger(__name__)
 
@@ -37,28 +37,28 @@ def setup_keys_group():
     pass
 
 
-def create_kms_key(
-    kms_client,
+def create_key_via_broker(
+    hsm_client,
     key_name: str,
     key_purpose: str,
-    description: str,
+    key_type: KeyType,
     add_timestamp: bool = True,
     verify_with_renesas: bool = True
 ) -> dict:
     """
-    Create a new ECC P-256 key in AWS KMS with Renesas compatibility verification.
-    
-    NEW: Uses Renesas imgtool to generate a reference key first, ensuring
-    the AWS KMS key format matches exactly what Renesas MCUboot expects.
-    
+    Create a new ECC P-256 key via the crypto broker using PKCS#11.
+
+    This function ensures all key generation goes through the broker
+    to AWS KMS, maintaining the security boundary.
+
     Args:
-        kms_client: Boto3 KMS client
+        hsm_client: HSM client (connected to broker)
         key_name: Base name for the key
         key_purpose: Purpose tag (oem_root, bootloader, customer)
-        description: Key description
+        key_type: KeyType enum value
         add_timestamp: If True, add timestamp to key name
         verify_with_renesas: If True, verify key format with Renesas imgtool
-    
+
     Returns:
         dict with KeyId, Arn, AliasName, CreationDate, RenesasVerified
     """
@@ -68,10 +68,10 @@ def create_kms_key(
         full_key_name = f"{key_name}_{timestamp}"
     else:
         full_key_name = key_name
-    
+
     renesas_verified = False
     reference_key_path = None
-    
+
     # STEP 1: Generate reference key with Renesas imgtool (if verification enabled)
     if verify_with_renesas:
         try:
@@ -88,88 +88,58 @@ def create_kms_key(
             logger.warning(f"Renesas imgtool verification failed: {e}")
             click.echo(f"   [WARN] Renesas imgtool verification skipped: {e}")
             renesas_verified = False
-    
+
     try:
-        # STEP 2: Create the key in AWS KMS
-        logger.info(f"Creating AWS KMS key: {full_key_name}")
-        click.echo(f"   [AWS KMS] Creating key in AWS KMS...")
-        response = kms_client.create_key(
-            KeyUsage='SIGN_VERIFY',
-            KeySpec='ECC_NIST_P256',
-            Description=description,
-            Tags=[
-                {'TagKey': 'Purpose', 'TagValue': key_purpose},
-                {'TagKey': 'Project', 'TagValue': 'RA8M1_Provisioning'},
-                {'TagKey': 'CreatedBy', 'TagValue': 'provisioning_tool'},
-                {'TagKey': 'CreationDate', 'TagValue': datetime.now(timezone.utc).isoformat()},
-                {'TagKey': 'RenesasVerified', 'TagValue': 'true' if renesas_verified else 'false'},
-            ]
+        # STEP 2: Create the key via broker (routes to AWS KMS)
+        logger.info(f"Creating key via broker: {full_key_name}")
+        click.echo(f"   [Broker] Creating key via PKCS#11...")
+
+        key_pair = hsm_client.generate_key_pair(
+            key_type=key_type,
+            curve=KeyCurve.SECP256R1,
+            label=full_key_name,
         )
-        
-        key_id = response['KeyMetadata']['KeyId']
-        key_arn = response['KeyMetadata']['Arn']
-        creation_date = response['KeyMetadata']['CreationDate']
-        
+
+        key_id = key_pair.private_key_handle
+        key_arn = key_id  # In KMS, the key ID is also the ARN reference
+        creation_date = datetime.now(timezone.utc)
+
         logger.info(f"   [+] Key created: {key_id}")
-        click.echo(f"   [AWS KMS] [OK] Key created: {key_id[:20]}...")
-        
-        # STEP 3: Verify AWS KMS key format matches Renesas (if reference key exists)
+        click.echo(f"   [Broker] ✓ Key created: {key_id[:20]}...")
+
+        # STEP 3: Verify key format matches Renesas (if reference key exists)
         if renesas_verified and reference_key_path:
             try:
-                # Get public key from AWS KMS
-                pub_key_response = kms_client.get_public_key(KeyId=key_id)
-                aws_pub_key_der = pub_key_response['PublicKey']
-                
+                # Get public key from broker
+                broker_pub_key_der = hsm_client.get_public_key(key_id)
+
                 # Compare with Renesas reference key
                 from cryptography.hazmat.primitives import serialization
                 from cryptography.hazmat.backends import default_backend
-                from cryptography.hazmat.primitives.serialization import load_pem_public_key
-                
+                from cryptography.hazmat.primitives.serialization import load_pem_public_key, load_der_public_key
+
                 # Load Renesas reference public key
                 renesas_pub_key = load_pem_public_key(
                     reference_pub_key,
                     backend=default_backend()
                 )
-                renesas_pub_key_der = renesas_pub_key.public_bytes(
-                    encoding=serialization.Encoding.DER,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                )
-                
-                # Load AWS KMS public key
-                from cryptography.hazmat.primitives.serialization import load_der_public_key
-                aws_pub_key = load_der_public_key(aws_pub_key_der, backend=default_backend())
-                
+
+                # Load broker public key
+                broker_pub_key = load_der_public_key(broker_pub_key_der, backend=default_backend())
+
                 # Compare curves (both should be SECP256R1)
-                if (hasattr(renesas_pub_key, 'curve') and hasattr(aws_pub_key, 'curve') and
-                    renesas_pub_key.curve.name == aws_pub_key.curve.name == 'secp256r1'):
-                    click.echo(f"   [Renesas] [OK] Key format verified: ECDSA P-256 (secp256r1)")
-                    logger.info("AWS KMS key format matches Renesas imgtool format")
+                if (hasattr(renesas_pub_key, 'curve') and hasattr(broker_pub_key, 'curve') and
+                    renesas_pub_key.curve.name == broker_pub_key.curve.name == 'secp256r1'):
+                    click.echo(f"   [Renesas] ✓ Key format verified: ECDSA P-256 (secp256r1)")
+                    logger.info("Key format matches Renesas imgtool format")
                 else:
                     click.echo(f"   [WARN] Key curve mismatch (should be secp256r1)")
                     logger.warning("Key curve verification failed")
-                    
+
             except Exception as e:
                 logger.warning(f"Renesas format verification failed: {e}")
                 click.echo(f"   [WARN] Could not verify key format: {e}")
-        
-        # Try to create alias (may fail due to permissions)
-        alias_name = f"alias/{full_key_name}"
-        alias_created = False
-        try:
-            kms_client.create_alias(
-                AliasName=alias_name,
-                TargetKeyId=key_id
-            )
-            alias_created = True
-            logger.info(f"   [+] Alias created: {alias_name}")
-            click.echo(f"   [AWS KMS] [OK] Alias created: {alias_name}")
-        except ClientError as e:
-            if 'AccessDeniedException' in str(e):
-                logger.warning(f"   [WARN]  Cannot create alias (permission denied). Key ID: {key_id}")
-                alias_name = None
-            else:
-                raise
-        
+
         # Cleanup reference key (temp file)
         if reference_key_path and reference_key_path.exists():
             try:
@@ -180,19 +150,22 @@ def create_kms_key(
                     pub_key_path.unlink()
             except Exception:
                 pass  # Ignore cleanup errors
-        
+
         return {
             'KeyId': key_id,
             'Arn': key_arn,
-            'AliasName': alias_name if alias_created else None,
+            'AliasName': full_key_name,
             'CreationDate': creation_date,
             'Purpose': key_purpose,
             'RenesasVerified': renesas_verified
         }
-    
-    except ClientError as e:
-        logger.error(f"Failed to create key: {e}")
-        raise ConfigurationError(f"Failed to create AWS KMS key: {e}")
+
+    except HSMError as e:
+        logger.error(f"Failed to create key via broker: {e}")
+        raise ConfigurationError(f"Failed to create key via broker: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error creating key: {e}")
+        raise ConfigurationError(f"Failed to create key: {e}")
 
 
 @setup_keys_group.command("create-keys")
@@ -280,76 +253,83 @@ def create_keys(
             click.echo(f"\n[+] Renesas imgtool found: {renesas_imgtool.name}")
             click.echo("   [INFO] Keys will be verified for Renesas compatibility")
     
-    # Load AWS credentials
+    # Connect to broker via HSM factory
     try:
-        creds = load_aws_credentials(fallback_to_env=True)
-        kms = boto3.client(
-            'kms',
-            region_name='eu-central-1',
-            aws_access_key_id=creds.access_key_id,
-            aws_secret_access_key=creds.secret_access_key
-        )
-        click.echo(f"\n[+] Connected to AWS KMS (region: eu-central-1)")
+        # Load config to get HSM settings
+        from config.loader import ConfigLoader
+        config_path = Path("project_config.json")
+        if not config_path.exists():
+            config_path = Path("config/default_config.json")
+        config_loader = ConfigLoader(config_path)
+        config = config_loader.load()
+
+        hsm_client = create_hsm_client(config.hsm)
+        hsm_client.connect()
+        click.echo(f"\n[+] Connected to crypto broker via PKCS#11")
     except Exception as e:
-        click.echo(f"\n[ERROR] Failed to connect to AWS KMS: {e}", err=True)
+        click.echo(f"\n[ERROR] Failed to connect to broker: {e}", err=True)
+        click.echo("   [TIP] Ensure the broker service is running: invoke broker-start", err=True)
         sys.exit(1)
-    
+
     created_keys = {
         'oem_root': [],
         'bootloader': [],
         'customer': []
     }
-    
-    # Create OEM Root keys
-    if not skip_oem_root:
-        click.echo("\n" + "-"*70)
-        click.echo(f"Creating {oem_root_count} OEM Root Key(s)")
-        click.echo("-"*70)
-        for i in range(oem_root_count):
-            key_info = create_kms_key(
-                kms,
-                key_name=f"RA8M1_OEM_ROOT_{i+1}",
-                key_purpose="oem_root",
-                description=f"RA8M1 OEM Root Key #{i+1} - Used for RKEY wrapping and Key Certificate",
-                verify_with_renesas=not skip_renesas_verification
-            )
-            created_keys['oem_root'].append(key_info)
-            verified_status = "[OK] Renesas Verified" if key_info.get('RenesasVerified') else "[WARN] Not Verified"
-            click.echo(f"   [+] OEM Root Key #{i+1}: {key_info['KeyId']} ({verified_status})")
-    
-    # Create Bootloader keys
-    if not skip_bootloader:
-        click.echo("\n" + "-"*70)
-        click.echo(f"Creating {bootloader_count} Bootloader Key(s)")
-        click.echo("-"*70)
-        for i in range(bootloader_count):
-            key_info = create_kms_key(
-                kms,
-                key_name=f"RA8M1_BOOTLOADER_{i+1}",
-                key_purpose="bootloader",
-                description=f"RA8M1 Bootloader Key #{i+1} - Used for Code Certificate (bootloader hash)",
-                verify_with_renesas=not skip_renesas_verification
-            )
-            created_keys['bootloader'].append(key_info)
-            verified_status = "[OK] Renesas Verified" if key_info.get('RenesasVerified') else "[WARN] Not Verified"
-            click.echo(f"   [+] Bootloader Key #{i+1}: {key_info['KeyId']} ({verified_status})")
-    
-    # Create Customer keys
-    if not skip_customer:
-        click.echo("\n" + "-"*70)
-        click.echo(f"Creating {customer_count} Customer Key(s)")
-        click.echo("-"*70)
-        for i in range(customer_count):
-            key_info = create_kms_key(
-                kms,
-                key_name=f"RA8M1_CUSTOMER_{i+1}",
-                key_purpose="customer",
-                description=f"RA8M1 Customer Key #{i+1} - Used for application signing",
-                verify_with_renesas=not skip_renesas_verification
-            )
-            created_keys['customer'].append(key_info)
-            verified_status = "[OK] Renesas Verified" if key_info.get('RenesasVerified') else "[WARN] Not Verified"
-            click.echo(f"   [+] Customer Key #{i+1}: {key_info['KeyId']} ({verified_status})")
+
+    try:
+        # Create OEM Root keys
+        if not skip_oem_root:
+            click.echo("\n" + "-"*70)
+            click.echo(f"Creating {oem_root_count} OEM Root Key(s)")
+            click.echo("-"*70)
+            for i in range(oem_root_count):
+                key_info = create_key_via_broker(
+                    hsm_client,
+                    key_name=f"RA8M1_OEM_ROOT_{i+1}",
+                    key_purpose="oem_root",
+                    key_type=KeyType.OEM_ROOT,
+                    verify_with_renesas=not skip_renesas_verification
+                )
+                created_keys['oem_root'].append(key_info)
+                verified_status = "✓ Renesas Verified" if key_info.get('RenesasVerified') else "⚠ Not Verified"
+                click.echo(f"   [+] OEM Root Key #{i+1}: {key_info['KeyId']} ({verified_status})")
+
+        # Create Bootloader keys
+        if not skip_bootloader:
+            click.echo("\n" + "-"*70)
+            click.echo(f"Creating {bootloader_count} Bootloader Key(s)")
+            click.echo("-"*70)
+            for i in range(bootloader_count):
+                key_info = create_key_via_broker(
+                    hsm_client,
+                    key_name=f"RA8M1_BOOTLOADER_{i+1}",
+                    key_purpose="bootloader",
+                    key_type=KeyType.OEM_BOOTLOADER,
+                    verify_with_renesas=not skip_renesas_verification
+                )
+                created_keys['bootloader'].append(key_info)
+                verified_status = "✓ Renesas Verified" if key_info.get('RenesasVerified') else "⚠ Not Verified"
+                click.echo(f"   [+] Bootloader Key #{i+1}: {key_info['KeyId']} ({verified_status})")
+
+        # Create Customer keys
+        if not skip_customer:
+            click.echo("\n" + "-"*70)
+            click.echo(f"Creating {customer_count} Customer Key(s)")
+            click.echo("-"*70)
+            for i in range(customer_count):
+                key_info = create_key_via_broker(
+                    hsm_client,
+                    key_name=f"RA8M1_CUSTOMER_{i+1}",
+                    key_purpose="customer",
+                    key_type=KeyType.CUSTOMER,
+                    verify_with_renesas=not skip_renesas_verification
+                )
+                created_keys['customer'].append(key_info)
+                verified_status = "✓ Renesas Verified" if key_info.get('RenesasVerified') else "⚠ Not Verified"
+                click.echo(f"   [+] Customer Key #{i+1}: {key_info['KeyId']} ({verified_status})")
+    finally:
+        hsm_client.disconnect()
     
     # Summary
     click.echo("\n" + "="*70)
@@ -418,23 +398,26 @@ def list_keys(show_all: bool, created_after: Optional[str]):
     Use --show-all to see all keys in the account.
     """
     click.echo("\n" + "="*70)
-    click.echo("AWS KMS Keys for RA8M1 Provisioning")
+    click.echo("Keys Available via Crypto Broker")
     click.echo("="*70)
-    
-    # Load AWS credentials
+
+    # Connect to broker via HSM factory
     try:
-        creds = load_aws_credentials(fallback_to_env=True)
-        kms = boto3.client(
-            'kms',
-            region_name='eu-central-1',
-            aws_access_key_id=creds.access_key_id,
-            aws_secret_access_key=creds.secret_access_key
-        )
-        click.echo(f"\n[+] Connected to AWS KMS (region: eu-central-1)\n")
+        from config.loader import ConfigLoader
+        config_path = Path("project_config.json")
+        if not config_path.exists():
+            config_path = Path("config/default_config.json")
+        config_loader = ConfigLoader(config_path)
+        config = config_loader.load()
+
+        hsm_client = create_hsm_client(config.hsm)
+        hsm_client.connect()
+        click.echo(f"\n[+] Connected to crypto broker via PKCS#11\n")
     except Exception as e:
-        click.echo(f"\n[ERROR] Failed to connect to AWS KMS: {e}", err=True)
+        click.echo(f"\n[ERROR] Failed to connect to broker: {e}", err=True)
+        click.echo("   [TIP] Ensure the broker service is running: invoke broker-start", err=True)
         sys.exit(1)
-    
+
     # Parse date filter
     date_filter = None
     if created_after:
@@ -443,74 +426,59 @@ def list_keys(show_all: bool, created_after: Optional[str]):
         except ValueError:
             click.echo(f"[ERROR] Invalid date format: {created_after}. Use YYYY-MM-DD", err=True)
             sys.exit(1)
-    
+
     try:
-        keys_response = kms.list_keys()
-        all_keys = keys_response['Keys']
-        
-        click.echo(f"Total keys in account: {len(all_keys)}\n")
-        
+        keys = hsm_client.list_keys()
+
+        click.echo(f"Total keys available: {len(keys)}\n")
+
         # Filter and display keys
         filtered_keys = []
-        for key_info in all_keys:
-            key_id = key_info['KeyId']
-            
-            try:
-                # Get key metadata
-                key_metadata = kms.describe_key(KeyId=key_id)['KeyMetadata']
-                
-                # Apply date filter
-                if date_filter and key_metadata['CreationDate'] < date_filter:
-                    continue
-                
-                # Get tags if not showing all
-                if not show_all:
-                    try:
-                        tags_response = kms.list_resource_tags(KeyId=key_id)
-                        tags = {tag['TagKey']: tag['TagValue'] for tag in tags_response.get('Tags', [])}
-                        
-                        # Skip if not an RA8M1 provisioning key
-                        if tags.get('Project') != 'RA8M1_Provisioning':
-                            continue
-                    except ClientError:
-                        # If can't read tags, skip
-                        continue
-                
-                # Get aliases
-                aliases = []
-                try:
-                    aliases_response = kms.list_aliases(KeyId=key_id)
-                    aliases = [a['AliasName'] for a in aliases_response.get('Aliases', [])]
-                except ClientError:
-                    pass
-                
-                # Get tags for display
-                try:
-                    tags_response = kms.list_resource_tags(KeyId=key_id)
-                    tags = {tag['TagKey']: tag['TagValue'] for tag in tags_response.get('Tags', [])}
-                except ClientError:
-                    tags = {}
-                
-                filtered_keys.append({
-                    'KeyId': key_id,
-                    'KeySpec': key_metadata.get('KeySpec', 'N/A'),
-                    'KeyUsage': key_metadata.get('KeyUsage', 'N/A'),
-                    'Description': key_metadata.get('Description', 'No description'),
-                    'CreationDate': key_metadata['CreationDate'],
-                    'Aliases': aliases,
-                    'Purpose': tags.get('Purpose', 'unknown'),
-                    'Tags': tags
-                })
-            
-            except ClientError as e:
-                if 'AccessDeniedException' not in str(e):
-                    logger.debug(f"Error reading key {key_id}: {e}")
+        for key_info in keys:
+            key_id = key_info.get('key_id') or key_info.get('KeyId', '')
+
+            # Get key metadata
+            key_spec = key_info.get('key_spec') or key_info.get('KeySpec', 'N/A')
+            key_usage = key_info.get('key_usage') or key_info.get('KeyUsage', 'N/A')
+            description = key_info.get('Description', '')
+            state = key_info.get('state') or key_info.get('KeyState', 'N/A')
+
+            # Skip disabled/deleted keys
+            if state not in ('Enabled', 'N/A', None):
                 continue
-        
+
+            # Apply key spec filter (only ECC signing keys)
+            if key_spec != 'ECC_NIST_P256':
+                if not show_all:
+                    continue
+
+            if key_usage != 'SIGN_VERIFY':
+                if not show_all:
+                    continue
+
+            # Determine purpose from description
+            purpose = 'unknown'
+            desc_lower = description.lower() if description else ''
+            if 'oem_root' in desc_lower or 'oem root' in desc_lower:
+                purpose = 'oem_root'
+            elif 'bootloader' in desc_lower:
+                purpose = 'bootloader'
+            elif 'customer' in desc_lower:
+                purpose = 'customer'
+
+            filtered_keys.append({
+                'KeyId': key_id,
+                'KeySpec': key_spec,
+                'KeyUsage': key_usage,
+                'Description': description or 'No description',
+                'Purpose': purpose,
+                'State': state,
+            })
+
         if not filtered_keys:
             click.echo("[!] No keys found matching criteria.")
             return
-        
+
         # Group by purpose
         keys_by_purpose = {
             'oem_root': [],
@@ -518,7 +486,7 @@ def list_keys(show_all: bool, created_after: Optional[str]):
             'customer': [],
             'unknown': []
         }
-        
+
         for key in filtered_keys:
             purpose = key['Purpose'].lower()
             if 'oem' in purpose or 'root' in purpose:
@@ -529,31 +497,31 @@ def list_keys(show_all: bool, created_after: Optional[str]):
                 keys_by_purpose['customer'].append(key)
             else:
                 keys_by_purpose['unknown'].append(key)
-        
+
         # Display grouped keys
         for purpose, keys in keys_by_purpose.items():
             if not keys:
                 continue
-            
+
             click.echo("-"*70)
             click.echo(f"{purpose.upper().replace('_', ' ')} Keys ({len(keys)})")
             click.echo("-"*70)
-            
+
             for key in keys:
                 click.echo(f"\nKey ID: {key['KeyId']}")
                 click.echo(f"  Type: {key['KeySpec']} | Usage: {key['KeyUsage']}")
                 click.echo(f"  Description: {key['Description']}")
-                click.echo(f"  Created: {key['CreationDate'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
-                if key['Aliases']:
-                    click.echo(f"  Aliases: {', '.join(key['Aliases'])}")
-        
+                click.echo(f"  State: {key['State']}")
+
         click.echo("\n" + "="*70)
         click.echo(f"Total provisioning keys: {len(filtered_keys)}")
         click.echo("="*70)
-    
-    except ClientError as e:
+
+    except Exception as e:
         click.echo(f"\n[ERROR] Failed to list keys: {e}", err=True)
         sys.exit(1)
+    finally:
+        hsm_client.disconnect()
 
 
 @setup_keys_group.command("create-cloudhsm-keys")

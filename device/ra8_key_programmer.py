@@ -181,9 +181,9 @@ class RA8KeyProgrammer:
         logger.debug(f"Key data length: {len(key_data)} bytes (expected: 132)")
         logger.debug(f"Key data breakdown:")
         logger.debug(f"  SKR: {SKR.hex()}")
-        logger.debug(f"  [0:32] (IV+encrypted first part): {message_data[0:32].hex()}")
-        logger.debug(f"  [32:48] (encrypted middle): {message_data[32:48].hex()}")
-        logger.debug(f"  [48:128] (encrypted last + padding): {message_data[48:128].hex()}")
+        logger.debug(f"  [0:32] (W-UFPK[4:36] wrapped UFPK): {message_data[0:32].hex()}")
+        logger.debug(f"  [32:48] (IV 16 bytes): {message_data[32:48].hex()}")
+        logger.debug(f"  [48:128] (encrypted key 80 bytes): {message_data[48:128].hex()}")
         logger.debug(f"  Full key_data: {key_data.hex()}")
         
         SUM = self.client._calc_sum(LNH + LNL + RES + key_data)
@@ -240,8 +240,17 @@ class RA8KeyProgrammer:
         if STS is not None and STS != 0x00:
             if STS == 0xDB:
                 raise DeviceError(
-                    "OEM Root Key already programmed (STS=0xDB). "
-                    "Full chip erase required! See logs for details."
+                    "OEM Root Key programming failed (STS=0xDB): "
+                    "Data verification error. Possible causes:\n"
+                    "  1. OEM Root Key already programmed → run chip-erase first\n"
+                    "  2. RKEY encrypted with wrong UFPK → regenerate RKEY with correct ufpk.key\n"
+                    "  3. RKEY format mismatch → check AES-CBC + CBC-MAC parameters\n"
+                    "See logs for details."
+                )
+            elif STS == 0xD3:
+                raise DeviceError(
+                    "OEM Root Key already programmed (STS=0xD3). "
+                    "Full chip erase required before re-programming."
                 )
             else:
                 logger.error(f"[ERROR] OEM ROOT KEY PROGRAMMING FAILED: STS=0x{STS:02X}")

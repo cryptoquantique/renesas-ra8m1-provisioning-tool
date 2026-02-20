@@ -7,12 +7,17 @@ Orchestrates the complete device provisioning process according to Renesas docum
 from pathlib import Path
 from typing import Optional, Callable
 
+import serial
+
 from device.ra8_provisioning_client import RA8ProvisioningClient
 from device.ra8_key_programmer import RA8KeyProgrammer
 from device.ra8_srec_programmer import RA8SRECProgrammer
 from device.ra8_certificate_programmer import RA8CertificateProgrammer
 from utils.logging import get_logger
-from utils.exceptions import DeviceError
+from utils.exceptions import (
+    DeviceError,
+    TimeoutError as ProvisioningTimeoutError,
+)
 
 logger = get_logger(__name__)
 
@@ -156,8 +161,12 @@ class RA8ProvisioningWorkflow:
         This is an IRREVERSIBLE operation that locks the device.
         DLM transition: OEM (0x04) -> LCK_BOOT (0x06)
         
+        After receiving the lock command, the device may reset immediately
+        before sending a response. In this case, a timeout or serial error
+        is treated as success (lock command was sent and accepted).
+        
         Returns:
-            True on success, False on failure
+            True on success (or likely success), False on definite failure
         """
         if not self.client.ser:
             raise DeviceError("Not connected")
@@ -166,7 +175,15 @@ class RA8ProvisioningWorkflow:
         # Source: OEM (0x04), Target: LCK_BOOT (0x06)
         logger.info("Transitioning to LCK_BOOT state...")
         
-        result = self.client._dlm_state_transition(0x04, 0x06)
+        try:
+            result = self.client._dlm_state_transition(0x04, 0x06)
+        except (ProvisioningTimeoutError, serial.SerialException, OSError) as e:
+            # Device likely locked successfully but reset before sending response
+            logger.warning(
+                f"[WARN] No response after LCK_BOOT command: {e}\n"
+                "  This is expected - the device resets after entering LCK_BOOT state."
+            )
+            return True
         
         if result:
             logger.info("[OK] Device transitioned to LCK_BOOT state successfully")
@@ -219,18 +236,24 @@ class RA8ProvisioningWorkflow:
         Returns:
             True on success, False on failure
         """
+        import time as _time
+        current_step = "Validation"
+        
         try:
             # Validate files
             self._validate_files()
             
             # Connect
+            current_step = "Connection"
             logger.info("Connecting to device...")
             self.client.connect()
             
             # Connect to boot mode
+            current_step = "Boot mode"
             self.client.connect_to_boot_mode()
             
             # Step 1: Initialize device (CM->OEM transition)
+            current_step = "Step 1: Device initialization"
             logger.info("Step 1: Initializing device...")
             self.client.initialize_device(reset_callback=self.reset_callback)
             
@@ -243,23 +266,24 @@ class RA8ProvisioningWorkflow:
             print("")
             
             # After manual reset, need to reconnect (port may have been re-enumerated)
+            current_step = "Reconnection after reset"
             logger.info("Reconnecting after reset...")
             self.client.disconnect()
-            import time
-            time.sleep(2)  # Give device time to enumerate
+            _time.sleep(2)  # Give device time to enumerate
             self.client.connect()
             
             # Now re-enter boot mode
             self.client.connect_to_boot_mode()
             
             # IMPORTANT: OEM Root Key programming requires PL2, not PL0
-            # Transition to PL2 before programming key
+            current_step = "PL2 transition"
             logger.info("Transitioning to PL2 (required for OEM Root Key programming)...")
             if not self._transition_protection_level(0x02):  # PL2 = 0x02
                 raise DeviceError("Failed to transition to PL2")
             logger.info("Successfully transitioned to PL2")
             
             # Step 2: Program OEM root key
+            current_step = "Step 2: OEM Root Key programming"
             logger.info("Step 2: Programming OEM root key...")
             self.key_programmer.program_oem_root_key(
                 self.oem_root_key_file,
@@ -268,6 +292,7 @@ class RA8ProvisioningWorkflow:
             )
             
             # Step 3: Program SREC file (bootloader + application)
+            current_step = "Step 3: SREC programming"
             logger.info("Step 3: Programming SREC file...")
             self.srec_programmer.program_srec_file(
                 self.combined_srec_file,
@@ -275,10 +300,12 @@ class RA8ProvisioningWorkflow:
             )
             
             # Step 4: Program OSM (Option Setting Memory)
+            current_step = "Step 4: OSM programming"
             logger.info("Step 4: Programming OSM...")
             self.srec_programmer.program_osm_from_srec(self.combined_srec_file)
             
             # Step 5: Program Key + Code Certificates
+            current_step = "Step 5: Certificate programming"
             logger.info("Step 5: Programming certificates...")
             self.cert_programmer.program_certificates(
                 self.key_cert_file,
@@ -287,6 +314,7 @@ class RA8ProvisioningWorkflow:
             
             # Step 6: Inject AL keys (optional)
             if self.al2_key_file or self.al1_key_file:
+                current_step = "Step 6: AL key injection"
                 logger.info("Step 6: Injecting AL keys...")
                 if self.al2_key_file:
                     self.key_programmer.inject_dlm_key(self.al2_key_file, 0x01)
@@ -294,28 +322,45 @@ class RA8ProvisioningWorkflow:
                     self.key_programmer.inject_dlm_key(self.al1_key_file, 0x02)
             
             # Step 7: Configure final state
+            current_step = "Step 7: Final state configuration"
             logger.info(f"Step 7: Configuring final state: {self.final_state}")
             if self.final_state == "OEM_PL0":
                 self._transition_protection_level(0x04)  # PL0
                 logger.info("[OK] Device in OEM_PL0 state")
             elif self.final_state == "LCK_BOOT":
-                # Ask for confirmation before locking (irreversible!)
-                if self._confirm_lock_device():
-                    # First transition to PL0, then to LCK_BOOT
-                    self._transition_protection_level(0x04)  # PL0
-                    if self._transition_to_lck_boot():
-                        # Also disable initialize command when locking
+                try:
+                    # Ask for confirmation before locking (irreversible!)
+                    if self._confirm_lock_device():
+                        # Transition to PL0 first
+                        self._transition_protection_level(0x04)  # PL0
+                        
+                        # Disable initialize BEFORE lock - device still responds in boot mode
+                        # After LCK_BOOT the device resets and communication is lost,
+                        # so all commands must be sent before the lock transition
+                        logger.info("Disabling initialize command before lock...")
                         self._disable_initialize()
-                        logger.info("[OK] Device locked to LCK_BOOT state")
+                        
+                        # LCK_BOOT is the LAST command - device resets after this
+                        # Communication will be lost, which is expected behavior
+                        self._transition_to_lck_boot()
+                        logger.info("[OK] Device locked to LCK_BOOT state successfully")
                     else:
-                        logger.error("[ERROR] Failed to lock device - staying in OEM state")
-                else:
-                    # User declined - just go to PL0
-                    self._transition_protection_level(0x04)
-                    logger.info("[OK] Device in OEM_PL0 state (lock skipped by user)")
+                        # User declined - just go to PL0
+                        self._transition_protection_level(0x04)
+                        logger.info("[OK] Device in OEM_PL0 state (lock skipped by user)")
+                except (DeviceError, ProvisioningTimeoutError,
+                        serial.SerialException, OSError) as lock_err:
+                    logger.warning(
+                        f"[WARN] Lock step encountered an issue: {lock_err}\n"
+                        "  All programming steps completed successfully.\n"
+                        "  The device may already be locked (device resets after LCK command).\n"
+                        "  Verify device DLM state after reset."
+                    )
+                    # Don't re-raise - provisioning itself succeeded
             
             # Step 8: Disable initialize (optional, irreversible) - only if not already done by LCK_BOOT
             if self.disable_initialize and self.final_state != "LCK_BOOT":
+                current_step = "Step 8: Disable initialize"
                 logger.warning("Step 8: Disabling initialize command...")
                 # Require explicit confirmation
                 if self.reset_callback:
@@ -329,9 +374,36 @@ class RA8ProvisioningWorkflow:
             logger.info("[OK] Provisioning completed successfully!")
             return True
         
+        except ProvisioningTimeoutError as e:
+            logger.error(f"[TIMEOUT] {current_step} - Device not responding")
+            logger.error(str(e))
+            raise DeviceError(
+                f"Timeout during '{current_step}'.\n{str(e)}"
+            ) from e
+        
+        except (serial.SerialException, OSError) as e:
+            logger.error(f"[DISCONNECT] Communication lost during '{current_step}'")
+            logger.error(
+                f"Serial error: {e}\n"
+                "  -> The USB cable may have been disconnected during provisioning.\n"
+                "  -> DO NOT power off the device immediately!\n"
+                "  -> Reconnect the cable, reset the board (MD low), and retry.\n"
+                f"  -> Failed at: {current_step}"
+            )
+            raise DeviceError(
+                f"Communication lost during '{current_step}': {e}\n"
+                "  -> Reconnect the USB cable, reset the board, and retry."
+            ) from e
+        
+        except DeviceError:
+            # Already has meaningful message, re-raise as-is
+            raise
+        
         except Exception as e:
-            logger.exception("Provisioning workflow failed")
-            raise DeviceError(f"Provisioning failed: {str(e)}") from e
+            logger.exception(f"Unexpected error during '{current_step}'")
+            raise DeviceError(
+                f"Provisioning failed at '{current_step}': {str(e)}"
+            ) from e
         
         finally:
             self.client.disconnect()

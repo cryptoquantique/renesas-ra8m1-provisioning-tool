@@ -15,9 +15,42 @@ from typing import Optional, Dict, List, Tuple, Callable
 from enum import IntEnum
 
 from utils.logging import get_logger
-from utils.exceptions import DeviceError
+from utils.exceptions import DeviceError, TimeoutError as ProvisioningTimeoutError
 
 logger = get_logger(__name__)
+
+
+# =====================================================================
+# Device error codes and human-readable descriptions
+# =====================================================================
+DEVICE_STS_CODES = {
+    0x00: "Success",
+    0xD0: "Key format error",
+    0xD1: "Key verification failed",
+    0xD3: "Already programmed (cannot reprogram without chip erase)",
+    0xDB: "Certificate/key programming warning",
+    0xDC: "Anti-rollback: certificate version too low",
+    0xE4: "Device state error (wrong DLM/PL state)",
+}
+
+
+def _check_serial_alive(ser) -> None:
+    """
+    Quick check that the serial port is still open and responsive.
+    Raises DeviceError if the port was lost (cable disconnect, etc.).
+    """
+    try:
+        if ser is None or not ser.is_open:
+            raise DeviceError(
+                "Serial port is closed. Possible USB cable disconnection.\n"
+                "  -> Reconnect the USB cable, reset the board, and retry."
+            )
+    except OSError as e:
+        raise DeviceError(
+            f"Serial port communication lost: {e}\n"
+            "  -> The USB cable may have been disconnected during operation.\n"
+            "  -> Reconnect the cable, reset the board (MD low), and retry."
+        ) from e
 
 
 class DLMState(IntEnum):
@@ -108,8 +141,31 @@ class RA8ProvisioningClient:
             self.ser.reset_output_buffer()
             self._connected = True
             logger.info(f"Connected to {self.ser.name}")
-        except Exception as e:
-            raise DeviceError(f"Failed to open serial port {self.com_port}: {e}")
+        except serial.SerialException as e:
+            error_str = str(e).lower()
+            if "access is denied" in error_str or "permissionerror" in error_str:
+                raise DeviceError(
+                    f"Cannot open {self.com_port}: Access denied.\n"
+                    f"  -> Close any other application using {self.com_port} (PuTTY, TeraTerm, etc.)\n"
+                    f"  -> Check that no other provisioning session is running."
+                )
+            elif "filenotfounderror" in error_str or "could not open port" in error_str:
+                raise DeviceError(
+                    f"COM port {self.com_port} not found.\n"
+                    f"  -> Check that the device is connected and powered on.\n"
+                    f"  -> Verify the device is in BOOT MODE (MD pin low).\n"
+                    f"  -> Check Device Manager for the correct COM port number."
+                )
+            else:
+                raise DeviceError(
+                    f"Failed to open serial port {self.com_port}: {e}\n"
+                    f"  -> Verify the device is connected and the COM port is correct."
+                )
+        except OSError as e:
+            raise DeviceError(
+                f"OS error opening {self.com_port}: {e}\n"
+                f"  -> The device may have been disconnected or the port is busy."
+            )
     
     def disconnect(self) -> None:
         """Close serial connection."""
@@ -140,20 +196,37 @@ class RA8ProvisioningClient:
         if not self.ser:
             raise DeviceError("Not connected")
         
+        _check_serial_alive(self.ser)
+        
         packet = bytearray()
         
         # Wait for SOD with timeout
         logger.debug("Waiting for response SOD...")
-        SOD = self.ser.read(1)
+        try:
+            SOD = self.ser.read(1)
+        except (serial.SerialException, OSError) as e:
+            raise DeviceError(
+                f"Lost communication with device: {e}\n"
+                "  -> The USB cable may have been disconnected.\n"
+                "  -> Reconnect the cable, reset the board (MD low), and retry."
+            ) from e
         
         if len(SOD) == 0:
             logger.error("No response from device (timeout)")
             # Check if there's any data in buffer
-            available = self.ser.in_waiting
-            if available > 0:
-                buffer_data = self.ser.read(available)
-                logger.error(f"Buffer contains {available} bytes: {buffer_data.hex()}")
-            raise DeviceError("No response from device")
+            try:
+                available = self.ser.in_waiting
+                if available > 0:
+                    buffer_data = self.ser.read(available)
+                    logger.error(f"Buffer contains {available} bytes: {buffer_data.hex()}")
+            except (serial.SerialException, OSError):
+                pass  # Port may already be gone
+            raise ProvisioningTimeoutError(
+                "No response from device (timeout).\n"
+                "  -> Verify the device is in BOOT MODE (hold SW1, press RESET, release RESET, release SW1).\n"
+                "  -> Check the USB cable connection.\n"
+                "  -> Try a different COM port or power-cycle the board."
+            )
         
         logger.debug(f"Received SOD: {SOD.hex()}")
         
@@ -207,18 +280,27 @@ class RA8ProvisioningClient:
         if not self.ser:
             raise DeviceError("Not connected")
         
+        _check_serial_alive(self.ser)
+        
         logger.debug("Establishing communication with boot firmware...")
         loopcount = 20
         
         while loopcount != 0:
-            self.ser.write(b'\x00\x00\x00')
-            time.sleep(self.SHORT_DELAY)
-            h = self.ser.read()
-            if h == b'\x00':
-                logger.debug("ACK received")
-                return True
-            loopcount -= 1
-            time.sleep(self.SHORT_DELAY)
+            try:
+                self.ser.write(b'\x00\x00\x00')
+                time.sleep(self.SHORT_DELAY)
+                h = self.ser.read()
+                if h == b'\x00':
+                    logger.debug("ACK received")
+                    return True
+                loopcount -= 1
+                time.sleep(self.SHORT_DELAY)
+            except (serial.SerialException, OSError) as e:
+                raise DeviceError(
+                    f"Lost communication during handshake: {e}\n"
+                    "  -> The device may have been disconnected.\n"
+                    "  -> Reconnect the cable, reset the board (MD low), and retry."
+                ) from e
         
         return False
     
@@ -343,6 +425,8 @@ class RA8ProvisioningClient:
         """
         Initialize device (CM->OEM transition via Initialize command).
         
+        Handles both virgin (CM state) and already-initialized (OEM state) devices.
+        
         Args:
             reset_callback: Optional callback function to call when reset is required.
                            If None, will prompt user via input().
@@ -353,19 +437,40 @@ class RA8ProvisioningClient:
         logger.info("Initializing MCU")
         
         # Get current DLM state
-        _, dlm = self.get_dlm_state()
+        try:
+            _, dlm = self.get_dlm_state()
+        except DeviceError as e:
+            raise DeviceError(
+                f"Cannot read device DLM state: {e}\n"
+                "  -> The device may not be in boot mode.\n"
+                "  -> Enter BOOT MODE: Hold SW1, Press RESET, Release RESET, Release SW1."
+            ) from e
+        
+        dlm_states = {
+            0x01: "CM (virgin)", 0x04: "OEM", 0x06: "LCK_BOOT",
+            0x07: "RMA_REQ", 0x08: "RMA_ACK", 0x09: "RMA_RET"
+        }
+        logger.info(f"Device state: {dlm_states.get(dlm, f'Unknown (0x{dlm:02X})')}")
         
         # Initialize command transitions device to OEM/PL2 regardless of current DLM
         # It clears: User area, Data area, Config area, EEP, Boundary, Key index
         # AND sets PL to PL2 (critical for OEM Root Key programming)
         
-        if dlm == 0x01:  # CM
-            logger.info("Device in CM state - transitioning to OEM first...")
-            self._dlm_state_transition(0x01, 0x04)
+        if dlm == 0x01:  # CM (virgin device)
+            logger.info("Virgin device detected (CM state) - transitioning to OEM...")
+            transition_ok = self._dlm_state_transition(0x01, 0x04)
+            if not transition_ok:
+                raise DeviceError(
+                    "Failed to transition virgin device from CM to OEM state.\n"
+                    "  -> The device may need a full chip erase first.\n"
+                    "  -> Or the device may require a different initialization sequence.\n"
+                    "  -> Try: 1) Power cycle the board, 2) Enter boot mode, 3) Retry."
+                )
+            logger.info("CM -> OEM transition successful")
             dlm = 0x04  # Update to OEM for Initialize command
         
         if dlm == 0x04:  # OEM (now includes both original OEM and transitioned from CM)
-            logger.info(f"Sending Initialize command (will set device to OEM/PL2)...")
+            logger.info("Sending Initialize command (will set device to OEM/PL2)...")
             
             # Send Initialize command
             SOH = b'\x01'
@@ -382,9 +487,16 @@ class RA8ProvisioningClient:
             
             rp = self._receive_data_packet()
             RES = rp[3] & 0x7F
+            STS = rp[4] if len(rp) > 4 else None
             
             if RES != 0x50:
-                raise DeviceError("Initialize failed")
+                sts_msg = f" (STS=0x{STS:02X})" if STS is not None else ""
+                raise DeviceError(
+                    f"Initialize command failed: RES=0x{RES:02X}{sts_msg}\n"
+                    "  -> The device may already be locked (LCK_BOOT state).\n"
+                    "  -> If the device was previously provisioned, use 'update-device' instead.\n"
+                    "  -> A chip erase may be required to reset the device."
+                )
             
             logger.info("Initialize successful - device will be in OEM/PL2 after reset")
             logger.warning("!!! RESET REQUIRED - Please reset the board with MD low !!!")
@@ -400,47 +512,103 @@ class RA8ProvisioningClient:
             self.connect()
             
             if not self._communication_setting():
-                raise DeviceError("Failed to reconnect after initialize")
+                raise DeviceError(
+                    "Failed to reconnect after initialize.\n"
+                    "  -> The board may not have been reset correctly.\n"
+                    "  -> Ensure MD pin is LOW, then press RESET.\n"
+                    "  -> Wait 2 seconds, then retry."
+                )
             
             self.ser.write(b'\x55')
             time.sleep(self.SHORT_DELAY)
             _ = self.ser.read()
+        elif dlm == 0x06:  # LCK_BOOT
+            raise DeviceError(
+                "Device is in LCK_BOOT state (locked).\n"
+                "  -> Initialize is not available for locked devices.\n"
+                "  -> Use 'update-device' to reprogram firmware on locked devices.\n"
+                "  -> A full chip erase (Renesas Flash Programmer) is needed to unlock."
+            )
         else:
             logger.warning(f"Device in DLM state 0x{dlm:02X} - Initialize not available")
+            raise DeviceError(
+                f"Device in unexpected DLM state: 0x{dlm:02X} ({dlm_states.get(dlm, 'Unknown')}).\n"
+                "  -> Only CM (virgin) and OEM devices can be initialized.\n"
+                "  -> A chip erase may be required."
+            )
         
         # Verify final state
-        _, dlm2 = self.get_dlm_state()
-        _, pl2 = self.get_protection_level()
-        _, al2 = self.get_authentication_level()
-        
-        logger.info("Initialization Complete")
-        logger.info(f"DLM: 0x{dlm2:02X} (expect 0x04 = OEM)")
-        logger.info(f"PL : 0x{pl2:02X} (0x04=PL0, 0x03=PL1, 0x02=PL2)")
-        logger.info(f"AL : 0x{al2:02X} (0x04=AL0, 0x03=AL1, 0x02=AL2)")
+        try:
+            _, dlm2 = self.get_dlm_state()
+            _, pl2 = self.get_protection_level()
+            _, al2 = self.get_authentication_level()
+            
+            logger.info("Initialization Complete")
+            logger.info(f"DLM: 0x{dlm2:02X} (expect 0x04 = OEM)")
+            logger.info(f"PL : 0x{pl2:02X} (0x04=PL0, 0x03=PL1, 0x02=PL2)")
+            logger.info(f"AL : 0x{al2:02X} (0x04=AL0, 0x03=AL1, 0x02=AL2)")
+            
+            if dlm2 != 0x04:
+                logger.warning(
+                    f"Device did not reach OEM state after initialization (DLM=0x{dlm2:02X}).\n"
+                    "  -> An additional reset may be required."
+                )
+        except DeviceError as e:
+            logger.warning(f"Could not verify device state after initialization: {e}")
     
     def connect_to_boot_mode(self) -> None:
         """Connect to boot mode."""
         if not self.ser:
             raise DeviceError("Not connected")
         
+        _check_serial_alive(self.ser)
+        
         logger.info("Connecting to Boot Mode")
         
         if not self._communication_setting():
-            self._command_inquiry()
-            rp = self._receive_data_packet()
-            if (rp[3] & 0x7F) != 0x00:
-                raise DeviceError("Failed to connect to boot mode")
+            logger.warning("Initial handshake failed, trying inquiry command...")
+            try:
+                self._command_inquiry()
+                rp = self._receive_data_packet()
+                if (rp[3] & 0x7F) != 0x00:
+                    raise DeviceError(
+                        "Failed to connect to boot mode.\n"
+                        "  -> The device is not responding to boot firmware commands.\n"
+                        "  -> Enter BOOT MODE: 1) Hold SW1, 2) Press RESET, 3) Release RESET, 4) Release SW1\n"
+                        "  -> Verify the USB cable is connected to the Full Speed USB port (NOT Debug).\n"
+                        "  -> Check that the correct COM port is selected."
+                    )
+            except ProvisioningTimeoutError:
+                raise ProvisioningTimeoutError(
+                    "Timeout connecting to device boot firmware.\n"
+                    "  -> The device is not responding. Ensure it is in BOOT MODE:\n"
+                    "     1) Hold SW1 button\n"
+                    "     2) Press RESET button\n"
+                    "     3) Release RESET\n"
+                    "     4) Release SW1 after 1-2 seconds\n"
+                    "  -> Verify the USB cable is connected to the Full Speed USB port.\n"
+                    "  -> Check that the COM port is correct (use Device Manager)."
+                )
         
-        self.ser.write(b'\x55')
-        time.sleep(self.SHORT_DELAY)
-        boot_code = self.ser.read()
+        try:
+            self.ser.write(b'\x55')
+            time.sleep(self.SHORT_DELAY)
+            boot_code = self.ser.read()
+        except (serial.SerialException, OSError) as e:
+            raise DeviceError(
+                f"Lost communication during boot mode connection: {e}\n"
+                "  -> Reconnect the USB cable and retry."
+            ) from e
         
         logger.info(f"Boot code received: {boot_code.hex() if boot_code else 'EMPTY'} (expected: c6)")
         
         if boot_code != b'\xC6':
-            raise DeviceError(f"Unexpected boot code: {boot_code.hex() if boot_code else 'EMPTY'}. "
-                            "Please enter BOOT MODE: 1) Hold SW1, 2) Press RESET, "
-                            "3) Release RESET, 4) Release SW1 after 1-2 sec")
+            raise DeviceError(
+                f"Unexpected boot code: {boot_code.hex() if boot_code else 'EMPTY'} (expected: 0xC6).\n"
+                "  -> The device is NOT in boot mode.\n"
+                "  -> Enter BOOT MODE: 1) Hold SW1, 2) Press RESET, 3) Release RESET, 4) Release SW1\n"
+                "  -> If the boot code is empty, the device may not be powered or the COM port is wrong."
+            )
         
         self._command_signature_request()
     

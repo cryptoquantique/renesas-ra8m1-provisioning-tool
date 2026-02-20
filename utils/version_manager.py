@@ -38,28 +38,44 @@ def get_credentials_file() -> Path:
 
 def get_current_certificate_version() -> int:
     """
-    Get current certificate version from aws_credentials.json.
+    Get current certificate version.
+    
+    Priority:
+        1. aws_credentials.json (versioning.certificate_version) - runtime state
+        2. project_config.json (certificates.version) - configured value
+        3. Default: 1
     
     Returns:
-        Current certificate version (default: 50 if not found)
+        Current certificate version
     """
+    # 1. Try aws_credentials.json (runtime state, auto-incremented)
     creds_file = get_credentials_file()
+    if creds_file.exists():
+        try:
+            with open(creds_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            versioning = data.get("versioning", {})
+            if "certificate_version" in versioning:
+                version = versioning["certificate_version"]
+                logger.debug(f"Certificate version from aws_credentials.json: {version}")
+                return version
+        except Exception as e:
+            logger.warning(f"Failed to read aws_credentials.json: {e}")
     
-    if not creds_file.exists():
-        logger.warning(f"Credentials file not found: {creds_file}")
-        return 50  # Default starting version
-    
+    # 2. Try project_config.json (configured value - SINGLE SOURCE OF TRUTH)
     try:
-        with open(creds_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        version = data.get("versioning", {}).get("certificate_version", 50)
-        logger.debug(f"Current certificate version: {version}")
+        from utils.project_config import get_project_config
+        proj_config = get_project_config()
+        version = proj_config.certificate_version
+        logger.debug(f"Certificate version from project_config.json: {version}")
         return version
-    
     except Exception as e:
-        logger.error(f"Failed to read certificate version: {e}")
-        return 50  # Default on error
+        logger.warning(f"Failed to read project_config.json: {e}")
+    
+    # 3. Default
+    logger.warning("No certificate version found in any config, using default: 1")
+    return 1
 
 
 def increment_certificate_version() -> int:

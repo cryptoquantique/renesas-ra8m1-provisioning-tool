@@ -14,9 +14,15 @@ from .certificates import (
     CodeCertificate,
     KeyCertificate,
 )
+from .device import (
+    CommunicationInterface,
+    DeviceInfo,
+    DeviceState,
+)
 from .keys import KeyCurve, KeyPair, KeyProvisioningData, KeyType, WrappedKey
 
 __all__ = [
+    # Certificates
     "Certificate",
     "CertificateType",
     "CertificateFormat",
@@ -24,6 +30,11 @@ __all__ = [
     "CertificateSigningRequest",
     "KeyCertificate",
     "CodeCertificate",
+    # Device
+    "CommunicationInterface",
+    "DeviceInfo",
+    "DeviceState",
+    # Keys
     "KeyPair",
     "KeyType",
     "KeyCurve",

@@ -1,0 +1,81 @@
+{
+  "policies": [
+    {
+      "client_id": "1000",
+      "platform": "linux",
+      "allowed_operations": [
+        "sign",
+        "sign_digest",
+        "verify",
+        "get_public_key",
+        "hash",
+        "list_keys"
+      ],
+      "allowed_key_arns": [
+        "arn:aws:kms:eu-central-1:*:key/*",
+        "alias/renesas_*"
+      ],
+      "denied_key_arns": [],
+      "max_requests_per_minute": 0,
+      "description": "Default Linux user (UID 1000) - full KMS access"
+    },
+    {
+      "client_id": "0",
+      "platform": "linux",
+      "allowed_operations": [
+        "sign",
+        "sign_digest",
+        "verify",
+        "get_public_key",
+        "hash",
+        "list_keys"
+      ],
+      "allowed_key_arns": [
+        "arn:aws:kms:*:*:key/*",
+        "alias/*"
+      ],
+      "denied_key_arns": [],
+      "max_requests_per_minute": 0,
+      "description": "Root user - full access"
+    },
+    {
+      "client_id": "S-1-5-21-*",
+      "platform": "windows",
+      "allowed_operations": [
+        "sign",
+        "sign_digest",
+        "verify",
+        "get_public_key",
+        "hash",
+        "list_keys"
+      ],
+      "allowed_key_arns": [
+        "arn:aws:kms:eu-central-1:*:key/*",
+        "alias/renesas_*"
+      ],
+      "denied_key_arns": [],
+      "max_requests_per_minute": 0,
+      "description": "Windows domain users - full KMS access"
+    }
+  ],
+  "default_policy": {
+    "client_id": "*",
+    "platform": "linux",
+    "allowed_operations": [
+      "ping",
+      "get_info",
+      "initialize",
+      "finalize",
+      "open_session",
+      "close_session",
+      "login",
+      "logout"
+    ],
+    "allowed_key_arns": [],
+    "denied_key_arns": [
+      "*"
+    ],
+    "max_requests_per_minute": 60,
+    "description": "Default fallback policy - session management only, no key access"
+  }
+}

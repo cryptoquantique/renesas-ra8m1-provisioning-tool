@@ -21,11 +21,13 @@ class SensitiveDataFilter(logging.Filter):
 
     SENSITIVE_PATTERNS = [
         "password",
-        "secret",
-        "key",
-        "token",
+        "secret_key",
+        "access_key",
+        "api_key",
+        "private_key",
+        "auth_token",
+        "bearer_token",
         "credential",
-        "private",
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:

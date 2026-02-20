@@ -31,6 +31,7 @@ class ProjectConfig:
     aws_access_key_id: str
     aws_secret_access_key: str
     aws_region: str
+    hsm_type: str  # 'broker' (recommended) or 'aws_kms' (direct)
 
     oem_root_key_id: str
     oem_bootloader_key_id: str
@@ -40,7 +41,6 @@ class ProjectConfig:
     application_bin: Path
     output_dir: Path
     srec_cat_exe: Path
-    skmt_path: Optional[Path]
 
     app_offset: str
     mcuboot_pubkey_addr: str
@@ -70,6 +70,9 @@ class ProjectConfig:
 
     certificate_version: int
     application_version: str
+
+    tools_gpg_path: str
+    tools_srec_cat_path: str
 
     _raw_config: Dict[str, Any]
     
@@ -199,6 +202,7 @@ class ProjectConfigLoader:
             imgtool = self._config_data['imgtool']
             certs = self._config_data['certificates']
             device = self._config_data.get('device', {})
+            tools = self._config_data.get('tools', {})
             
             return ProjectConfig(
                 # Project
@@ -215,6 +219,7 @@ class ProjectConfigLoader:
                 aws_access_key_id=require(aws, 'access_key_id', 'aws'),
                 aws_secret_access_key=require(aws, 'secret_access_key', 'aws'),
                 aws_region=require(aws, 'region', 'aws'),
+                hsm_type=aws.get('hsm_type', 'broker'),  # 'broker' (auto-start daemon) or 'aws_kms'
                 
                 # KMS (REQUIRED)
                 oem_root_key_id=require(kms, 'oem_root_key_id', 'aws.kms'),
@@ -226,7 +231,6 @@ class ProjectConfigLoader:
                 application_bin=base_path / require(paths, 'application_bin', 'paths'),
                 output_dir=base_path / require(paths, 'output_dir', 'paths'),
                 srec_cat_exe=base_path / require(paths, 'srec_cat_exe', 'paths'),
-                skmt_path=base_path / Path(paths.get('skmt_path', '')) if paths.get('skmt_path') else None,
                 
                 # Firmware (REQUIRED)
                 app_offset=require(firmware, 'app_offset', 'firmware'),
@@ -254,13 +258,17 @@ class ProjectConfigLoader:
                 
                 # Device (optional)
                 device_type=device.get('type', 'ra8m1'),
-                device_interface=device.get('interface', 'rfp'),
+                device_interface=device.get('interface', 'serial'),
                 device_com_port=device.get('com_port'),
                 device_lock_after_provisioning=device.get('lock_after_provisioning', False),
                 
                 # Versioning (REQUIRED)
                 certificate_version=require(certs, 'version', 'certificates'),
                 application_version=require(certs, 'application_version', 'certificates'),
+                
+                # External tools (optional - auto-detected if empty)
+                tools_gpg_path=tools.get('gpg_path', ''),
+                tools_srec_cat_path=tools.get('srec_cat_path', ''),
                 
                 # Raw config
                 _raw_config=self._config_data

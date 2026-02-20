@@ -4,6 +4,7 @@ RA8 SREC Programming Module.
 Handles SREC file parsing and programming, including OSM (Option Setting Memory) handling.
 """
 
+import serial
 import time
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -30,15 +31,45 @@ class RA8SRECProgrammer:
     def _parse_srec_file_strict(self, filename: Path) -> List[Tuple[int, bytes]]:
         """Parse S1/S2/S3 records, verify checksum, return list of (address, bytes)."""
         blocks = []
+        checksum_errors = []
+        format_errors = []
+        
         try:
             with open(filename, 'r') as f:
-                for ln, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line or line[0] != 'S':
-                        continue
-                    
-                    rtype = line[1]
-                    if rtype in ('1', '2', '3'):
+                lines = f.readlines()
+        except Exception as e:
+            raise DeviceError(
+                f"Cannot read SREC file: {filename}\n"
+                f"  Error: {e}\n"
+                f"  -> Verify the file exists and is not corrupted."
+            )
+        
+        if not lines:
+            raise DeviceError(
+                f"SREC file is empty: {filename}\n"
+                "  -> The combined SREC file may not have been generated correctly.\n"
+                "  -> Re-run: invoke make-combined-srec"
+            )
+        
+        # Basic format validation
+        has_s_records = any(line.strip().startswith('S') for line in lines)
+        if not has_s_records:
+            raise DeviceError(
+                f"Invalid SREC file format: {filename}\n"
+                "  -> The file does not contain any S-records.\n"
+                "  -> This may be a corrupted or wrong file format.\n"
+                "  -> Re-generate the SREC file."
+            )
+        
+        try:
+            for ln, line in enumerate(lines, 1):
+                line = line.strip()
+                if not line or line[0] != 'S':
+                    continue
+                
+                rtype = line[1]
+                if rtype in ('1', '2', '3'):
+                    try:
                         count = int(line[2:4], 16)
                         addr_len = 4 if rtype == '1' else (6 if rtype == '2' else 8)
                         address = int(line[4:4+addr_len], 16)
@@ -46,20 +77,52 @@ class RA8SRECProgrammer:
                         data_end = 4 + (count * 2)
                         data_hex = line[data_start:data_end-2]
                         raw = bytes.fromhex(line[2:data_end])
-                        
-                        if (sum(raw) & 0xFF) != 0xFF:
-                            raise ValueError(f"SREC line {ln}: checksum mismatch")
-                        
-                        data = bytes.fromhex(data_hex)
-                        blocks.append((address, data))
-                    else:
-                        # S0/S5/S7/S8/S9 ignored
+                    except (ValueError, IndexError) as parse_err:
+                        format_errors.append(f"Line {ln}: {parse_err}")
                         continue
+                    
+                    if (sum(raw) & 0xFF) != 0xFF:
+                        checksum_errors.append(ln)
+                        continue
+                    
+                    data = bytes.fromhex(data_hex)
+                    blocks.append((address, data))
+                else:
+                    # S0/S5/S7/S8/S9 ignored
+                    continue
+            
+            # Report errors
+            if checksum_errors:
+                lines_str = ", ".join(str(l) for l in checksum_errors[:10])
+                suffix = f" (and {len(checksum_errors)-10} more)" if len(checksum_errors) > 10 else ""
+                raise DeviceError(
+                    f"Corrupted SREC file: {filename}\n"
+                    f"  Checksum mismatch on {len(checksum_errors)} line(s): {lines_str}{suffix}\n"
+                    "  -> The firmware image may be corrupted.\n"
+                    "  -> Re-build the firmware and re-generate the SREC file.\n"
+                    "  -> Re-run: invoke sign-app && invoke make-combined-srec"
+                )
+            
+            if format_errors:
+                errors_str = "; ".join(format_errors[:5])
+                raise DeviceError(
+                    f"Invalid SREC format in: {filename}\n"
+                    f"  Parse errors: {errors_str}\n"
+                    "  -> The firmware image may be corrupted or in a wrong format.\n"
+                    "  -> Re-build the firmware in e2studio and re-generate the SREC file."
+                )
             
             return blocks
+        
+        except DeviceError:
+            raise
         except Exception as e:
             logger.error(f"Error parsing SREC file: {e}")
-            raise DeviceError(f"Failed to parse SREC file: {e}")
+            raise DeviceError(
+                f"Failed to parse SREC file: {filename}\n"
+                f"  Error: {e}\n"
+                "  -> The file may be corrupted. Re-generate it."
+            )
     
     def _merge_contiguous_blocks(self, blocks: List[Tuple[int, bytes]], phrase_size: int = 128) -> List[Tuple[int, bytes]]:
         """
@@ -194,6 +257,9 @@ class RA8SRECProgrammer:
         if not self.client.ser:
             raise DeviceError("Not connected")
         
+        from device.ra8_provisioning_client import _check_serial_alive
+        _check_serial_alive(self.client.ser)
+        
         # Command packet (announce address span)
         SOH = b'\x01'
         LNH = b'\x00'
@@ -204,21 +270,34 @@ class RA8SRECProgrammer:
         SUM = self.client._calc_sum(LNH + LNL + CMD + SAD + EAD)
         ETX = b'\x03'
         
-        self.client.ser.write(SOH + LNH + LNL + CMD + SAD + EAD + SUM + ETX)
-        time.sleep(self.client.FLASH_WRITE_DELAY)
+        try:
+            self.client.ser.write(SOH + LNH + LNL + CMD + SAD + EAD + SUM + ETX)
+            time.sleep(self.client.FLASH_WRITE_DELAY)
+        except (serial.SerialException, OSError) as e:
+            raise DeviceError(
+                f"Communication lost during flash write at 0x{address:08X}: {e}\n"
+                "  -> USB cable may have been disconnected.\n"
+                "  -> DO NOT power off the device! Reconnect and retry."
+            ) from e
         
         rp = self.client._receive_data_packet()
         st = self.client._decode_status_packet(rp)
         
         if st.get("RES") != 0x13:
-            logger.error(f"WRITE cmd nack: {st}")
+            logger.error(f"WRITE cmd rejected at 0x{address:08X}: {st}")
             return False
         
         if st.get("STS") not in (0x00, None):
-            logger.error(f"WRITE cmd nack: {st}")
+            sts = st.get("STS")
+            logger.error(
+                f"WRITE cmd error at 0x{address:08X}: STS=0x{sts:02X}\n"
+                f"  -> The device rejected the write command.\n"
+                f"  -> If this is a repeated error, the firmware image may be corrupted."
+            )
             return False
         
         # Data chunks (<=1024 bytes each)
+        import serial as _serial
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset+1024]
@@ -230,18 +309,29 @@ class RA8SRECProgrammer:
             SUM = self.client._calc_sum(LNH + LNL + RES + chunk)
             ETX = b'\x03'
             
-            self.client.ser.write(SOD + LNH + LNL + RES + chunk + SUM + ETX)
-            time.sleep(self.client.FLASH_WRITE_DELAY)
+            try:
+                self.client.ser.write(SOD + LNH + LNL + RES + chunk + SUM + ETX)
+                time.sleep(self.client.FLASH_WRITE_DELAY)
+            except (_serial.SerialException, OSError) as e:
+                raise DeviceError(
+                    f"Communication lost during flash data write at 0x{address + offset:08X}: {e}\n"
+                    "  -> USB cable may have been disconnected during programming.\n"
+                    "  -> DO NOT power off the device! Reconnect and retry."
+                ) from e
             
             rp = self.client._receive_data_packet()
             st = self.client._decode_status_packet(rp)
             
             if st.get("RES") != 0x13:
-                logger.error(f"WRITE data nack: {st}")
+                logger.error(f"WRITE data rejected at 0x{address + offset:08X}: {st}")
                 return False
             
             if st.get("STS") not in (0x00, None):
-                logger.error(f"WRITE data nack: {st}")
+                sts = st.get("STS")
+                logger.error(
+                    f"WRITE data error at 0x{address + offset:08X}: STS=0x{sts:02X}\n"
+                    f"  -> Flash write rejected by device. The firmware image may be corrupted."
+                )
                 return False
             
             offset += len(chunk)

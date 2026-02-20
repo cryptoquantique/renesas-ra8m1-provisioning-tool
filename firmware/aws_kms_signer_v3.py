@@ -87,50 +87,73 @@ def sign_image_with_aws_kms(
     if not input_file.exists():
         raise FirmwareError(f"Input file not found: {input_file}")
 
+    # Determine signing backend for log messages
+    hsm_type = config.hsm_type.lower() if config.hsm_type else "broker"
+    if hsm_type == "broker":
+        backend_label = "PKCS#11 Broker → AWS KMS"
+    elif hsm_type == "aws_kms":
+        backend_label = "AWS KMS (direct)"
+    else:
+        backend_label = hsm_type
+
     logger.info(f"")
     logger.info(f"=" * 70)
-    logger.info(f"AWS KMS FIRMWARE SIGNING - WORKFLOW v3 (CORRECT)")
+    logger.info(f"FIRMWARE SIGNING via {backend_label}")
     logger.info(f"=" * 70)
     logger.info(f"  Input:  {input_file}")
     logger.info(f"  Output: {output_file}")
     logger.info(f"  Key ID: {aws_kms_key_id}")
+    logger.info(f"  Backend: {backend_label}")
 
     try:
         hsm_client = create_hsm_client(config)
         hsm_client.connect()
+
+        # Get public key from HSM (AWS KMS or broker)
         public_key_der = hsm_client.get_public_key(aws_kms_key_id)
 
+        # Determine curve from public key DER (works with any HSM backend)
         try:
-            key_info = hsm_client.kms_client.describe_key(KeyId=aws_kms_key_id)
-            key_spec = key_info["KeyMetadata"]["KeySpec"]
-            
-            curve_map = {
-                "ECC_NIST_P256": KeyCurve.SECP256R1,
-                "ECC_NIST_P384": KeyCurve.SECP384R1,
-                "ECC_NIST_P521": KeyCurve.SECP521R1,
-            }
-            
-            if key_spec not in curve_map:
-                raise FirmwareError(f"Unsupported key spec: {key_spec}")
-            
-            curve = curve_map[key_spec]
+            from cryptography.hazmat.primitives.serialization import load_der_public_key
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.backends import default_backend
+
+            pub_key = load_der_public_key(public_key_der, backend=default_backend())
+            if not isinstance(pub_key, ec.EllipticCurvePublicKey):
+                raise FirmwareError("Key is not an ECC key")
+
+            key_curve = pub_key.curve
+            if isinstance(key_curve, ec.SECP256R1):
+                curve = KeyCurve.SECP256R1
+            elif isinstance(key_curve, ec.SECP384R1):
+                curve = KeyCurve.SECP384R1
+            elif isinstance(key_curve, ec.SECP521R1):
+                curve = KeyCurve.SECP521R1
+            else:
+                raise FirmwareError(f"Unsupported curve: {key_curve.name}")
+
             logger.info(f"  Curve:  {curve.value}")
         except Exception as e:
-            raise FirmwareError(f"Failed to get key info: {str(e)}") from e
+            raise FirmwareError(f"Failed to determine key curve: {str(e)}") from e
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_dir = Path(tmpdir)
             
-            # Save AWS KMS public key to PEM file
-            pub_key_file = tmp_dir / "aws_kms_public_key.pem"
+            # Save HSM public key to PEM file (temp for imgtool)
+            pub_key_file = tmp_dir / "hsm_public_key.pem"
             save_public_key_pem(public_key_der, pub_key_file, curve)
-            logger.info(f"  Saved AWS KMS public key: {pub_key_file.name}")
+            logger.info(f"  Saved {backend_label} public key: {pub_key_file.name}")
             
-            # STEP 1: Generate dummy signed image with AWS KMS public key
+            # Also save to output directory for later use (avoids reconnect)
+            customer_pk_pem = output_file.parent / "customer_public.pem"
+            save_public_key_pem(public_key_der, customer_pk_pem, curve)
+            logger.info(f"  Customer public key saved: {customer_pk_pem.name}")
+            
+            # STEP 1: Generate dummy signed image with HSM public key
             logger.info(f"")
             logger.info(f"STEP 1: Generate temporary signed image")
-            logger.info(f"  Purpose: Create MCUBoot structure with correct KEYHASH for AWS KMS key")
-            logger.info(f"  CRITICAL: Use AWS KMS public key for KEYHASH calculation!")
+            logger.info(f"  Purpose: Create MCUBoot structure with correct KEYHASH for {backend_label} key")
+            logger.info(f"  CRITICAL: Use {backend_label} public key for KEYHASH calculation!")
 
             if not allow_local_temp_keys:
                 raise FirmwareError(
@@ -143,7 +166,7 @@ def sign_image_with_aws_kms(
             )
             logger.info(f"  Generated temporary local key: {tmp_priv_key.name}")
             logger.info(f"  This key will ONLY be used for dummy signature!")
-            logger.info(f"  KEYHASH will be calculated from AWS KMS public key!")
+            logger.info(f"  KEYHASH will be calculated from {backend_label} public key!")
 
             tmp_signed = tmp_dir / "dummy_signed.bin"
             
@@ -202,7 +225,7 @@ def sign_image_with_aws_kms(
 
             logger.info(f"")
             logger.info(f"STEP 2: Extract SHA256 hash from TLV & Fix KEYHASH")
-            logger.info(f"  Purpose: Get the ACTUAL hash + Replace dummy KEYHASH with AWS KMS KEYHASH")
+            logger.info(f"  Purpose: Get the ACTUAL hash + Replace dummy KEYHASH with {backend_label} KEYHASH")
 
             dummy_data = bytearray(tmp_signed.read_bytes())
 
@@ -269,34 +292,34 @@ def sign_image_with_aws_kms(
             
             logger.info(f"  Dummy signature: {len(dummy_signature)} bytes (DER format)")
             logger.info(f"")
-            logger.info(f"  [CRITICAL FIX] Replacing dummy KEYHASH with AWS KMS KEYHASH...")
+            logger.info(f"  [CRITICAL FIX] Replacing dummy KEYHASH with {backend_label} KEYHASH...")
 
-            aws_kms_keyhash = hashlib.sha256(public_key_der).digest()
+            hsm_keyhash = hashlib.sha256(public_key_der).digest()
             logger.info(f"  Dummy KEYHASH:   {dummy_keyhash.hex()}")
-            logger.info(f"  AWS KMS KEYHASH: {aws_kms_keyhash.hex()}")
+            logger.info(f"  {backend_label} KEYHASH: {hsm_keyhash.hex()}")
             
-            if len(aws_kms_keyhash) != len(dummy_keyhash):
-                raise FirmwareError(f"KEYHASH length mismatch! {len(aws_kms_keyhash)} != {len(dummy_keyhash)}")
+            if len(hsm_keyhash) != len(dummy_keyhash):
+                raise FirmwareError(f"KEYHASH length mismatch! {len(hsm_keyhash)} != {len(dummy_keyhash)}")
 
-            dummy_data[keyhash_tlv_offset:keyhash_tlv_offset+len(aws_kms_keyhash)] = aws_kms_keyhash
+            dummy_data[keyhash_tlv_offset:keyhash_tlv_offset+len(hsm_keyhash)] = hsm_keyhash
             logger.info(f"  KEYHASH replaced at offset 0x{keyhash_tlv_offset:X}")
             logger.info(f"  SHA256 hash extracted: {sha256_hash.hex()}")
 
             logger.info(f"")
-            logger.info(f"STEP 3: Sign hash with AWS KMS")
+            logger.info(f"STEP 3: Sign hash with {backend_label}")
             signature_der = hsm_client.sign_digest(aws_kms_key_id, sha256_hash)
-            logger.info(f"  AWS KMS signature: {len(signature_der)} bytes (DER format)")
+            logger.info(f"  {backend_label} signature: {len(signature_der)} bytes (DER format)")
             logger.debug(f"  Signature (DER): {signature_der.hex()[:64]}...")
             
             
-            # STEP 4: Use AWS KMS signature AS-IS
+            # STEP 4: Use HSM signature AS-IS
             logger.info(f"")
-            logger.info(f"STEP 4: Prepare AWS KMS signature for injection")
+            logger.info(f"STEP 4: Prepare {backend_label} signature for injection")
             logger.info(f"  Dummy signature: {len(dummy_signature)} bytes (padded by --pad-sig)")
-            logger.info(f"  AWS KMS signature (DER): {len(signature_der)} bytes")
+            logger.info(f"  {backend_label} signature (DER): {len(signature_der)} bytes")
 
             if signature_der[0] != 0x30:
-                raise FirmwareError(f"AWS KMS signature is not DER format (expected 0x30, got 0x{signature_der[0]:02X})")
+                raise FirmwareError(f"HSM signature is not DER format (expected 0x30, got 0x{signature_der[0]:02X})")
 
             offset = 2
             if signature_der[offset] != 0x02:
@@ -360,16 +383,16 @@ def sign_image_with_aws_kms(
             dummy_sig_len = len(dummy_signature)
             signature_final = signature_final_der
             logger.info(f"")
-            logger.info(f"STEP 5: Replace dummy signature with AWS KMS signature")
+            logger.info(f"STEP 5: Replace dummy signature with {backend_label} signature")
             logger.info(f"  Dummy signature: {len(dummy_signature)} bytes")
-            logger.info(f"  AWS KMS signature: {len(signature_final)} bytes")
+            logger.info(f"  {backend_label} signature: {len(signature_final)} bytes")
             logger.info(f"  Signature offset: 0x{sig_offset:X}")
             
             if len(dummy_signature) == len(signature_final):
                 logger.info(f"  Same size → Direct replacement (preserves structure!)")
                 final_data = (
                     dummy_data[:sig_offset] +
-                    signature_final +  # AWS KMS signature
+                    signature_final +  # HSM signature
                     dummy_data[sig_offset + len(dummy_signature):]  # After signature
                 )
                 logger.info(f"TLV_TOTAL_LENGTH preserved: {tlv_tot_len} bytes (includes --pad-sig padding)")
@@ -453,11 +476,11 @@ def sign_image_with_aws_kms(
             output_size = output_file.stat().st_size
             logger.info(f"")
             logger.info(f"=" * 70)
-            logger.info(f"AWS KMS SIGNING SUCCESSFUL!")
+            logger.info(f"SIGNING SUCCESSFUL via {backend_label}!")
             logger.info(f"=" * 70)
             logger.info(f"  Output file: {output_file}")
             logger.info(f"  Size: {output_size} bytes (0x{output_size:X})")
-            logger.info(f"  AWS KMS Key: {aws_kms_key_id}")
+            logger.info(f"  Key ID: {aws_kms_key_id}")
             logger.info(f"  Hash: {sha256_hash.hex()[:32]}...")
             logger.info(f"  Signature: ECDSA-P256 ({len(signature_final)} bytes DER+padding, Renesas format)")
             logger.info(f"=" * 70)
@@ -465,4 +488,4 @@ def sign_image_with_aws_kms(
         hsm_client.disconnect()
 
     except Exception as e:
-        raise FirmwareError(f"AWS KMS signing failed: {str(e)}") from e
+        raise FirmwareError(f"Firmware signing failed ({backend_label}): {str(e)}") from e

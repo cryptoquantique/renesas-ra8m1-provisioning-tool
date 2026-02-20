@@ -10,6 +10,7 @@ from .export_pgp_public_key import export_pgp_public_key
 from .setup_keys import setup_keys_group
 from .version import version_group
 from .chip_erase import chip_erase
+from .broker import broker_group
 
 __all__ = [
     "workflow_group",
@@ -18,4 +19,5 @@ __all__ = [
     "setup_keys_group",
     "version_group",
     "chip_erase",
+    "broker_group",
 ]
